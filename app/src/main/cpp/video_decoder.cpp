@@ -315,7 +315,6 @@ private:
         jpegFrame.clear();
         jpegFid = -1;
         jpegDropUntilBoundary = false;
-        mjpegPending.clear();
     }
 
     void feedDvBytes(const uint8_t* bytes, size_t length) {
