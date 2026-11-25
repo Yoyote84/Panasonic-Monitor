@@ -25,14 +25,24 @@ if(NOT FFMPEG_ROOT)
     message(FATAL_ERROR "FFMPEG_ROOT must point to the pinned Android FFmpeg build")
 endif()
 
-find_path(FFMPEG_INCLUDE_DIR libavcodec/avcodec.h
-    PATHS "${FFMPEG_ROOT}/include" NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
-find_library(FFMPEG_AVCODEC avcodec PATHS "${FFMPEG_ROOT}/lib" NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
-find_library(FFMPEG_AVUTIL avutil PATHS "${FFMPEG_ROOT}/lib" NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
-find_library(FFMPEG_SWSCALE swscale PATHS "${FFMPEG_ROOT}/lib" NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
-if(NOT FFMPEG_INCLUDE_DIR OR NOT FFMPEG_AVCODEC OR NOT FFMPEG_AVUTIL OR NOT FFMPEG_SWSCALE)
-    message(FATAL_ERROR "Pinned FFmpeg headers/libraries are missing; run scripts/build-ffmpeg-android.sh first")
-endif()
+set(FFMPEG_INCLUDE_DIR "${FFMPEG_ROOT}/include")
+set(FFMPEG_AVCODEC "${FFMPEG_ROOT}/lib/libavcodec.so")
+set(FFMPEG_AVUTIL "${FFMPEG_ROOT}/lib/libavutil.so")
+set(FFMPEG_SWSCALE "${FFMPEG_ROOT}/lib/libswscale.so")
+
+foreach(required_path
+        "${FFMPEG_INCLUDE_DIR}/libavcodec/avcodec.h"
+        "${FFMPEG_INCLUDE_DIR}/libavutil/avutil.h"
+        "${FFMPEG_INCLUDE_DIR}/libswscale/swscale.h"
+        "${FFMPEG_AVCODEC}"
+        "${FFMPEG_AVUTIL}"
+        "${FFMPEG_SWSCALE}")
+    if(NOT EXISTS "${required_path}")
+        message(FATAL_ERROR "FFmpeg Android artifact missing: ${required_path}. Run scripts/build-ffmpeg-android.sh first.")
+    endif()
+endforeach()
+
+message(STATUS "Using pinned FFmpeg headers and shared libraries from ${FFMPEG_ROOT}")
 
 add_library(ffmpeg_avcodec SHARED IMPORTED)
 set_target_properties(ffmpeg_avcodec PROPERTIES IMPORTED_LOCATION "${FFMPEG_AVCODEC}")
