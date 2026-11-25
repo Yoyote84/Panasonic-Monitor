@@ -1,17 +1,21 @@
 #include "video_decoder.h"
 
 #include <android/native_window.h>
+
+extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/error.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/pixfmt.h>
 #include <libswscale/swscale.h>
+}
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <sstream>
 #include <thread>
@@ -533,7 +537,6 @@ private:
     std::atomic<bool> resyncRequested{false};
     std::thread worker;
 
-    const AVCodec* decoder = nullptr;
     AVCodecContext* codecContext = nullptr;
     AVPacket* packet = nullptr;
     AVFrame* decodedFrame = nullptr;
@@ -544,7 +547,6 @@ private:
     int dvSyncMatch = 0;
     bool dvSynced = false;
 
-    std::vector<uint8_t> mjpegPending;
     std::vector<uint8_t> jpegFrame;
     int jpegFid = -1;
     bool jpegDropUntilBoundary = false;
