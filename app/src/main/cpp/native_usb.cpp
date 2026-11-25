@@ -552,6 +552,7 @@ std::string runProbe(int fd, int selectedMode, int durationMs) {
         goto cleanup;
     }
 
+    {
     // Diagnose and, when supported, detach a kernel driver only for the UVC
     // VideoStreaming interface selected from the descriptors. Audio interfaces
     // and the VideoControl interface are deliberately left untouched.
@@ -625,6 +626,7 @@ std::string runProbe(int fd, int selectedMode, int durationMs) {
         goto cleanup;
     }
     interfaceClaimed = true;
+    }
 
     {
         unsigned char lengthBytes[2] = {0, 0};
