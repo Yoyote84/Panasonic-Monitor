@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FFMPEG_COMMIT="74e4393595cf2b5857f0da925c4e0dd74ea306e5"
 FFMPEG_DIR="${ROOT}/build/ffmpeg-src"
 PREFIX="${ROOT}/app/build/ffmpeg/arm64-v8a"
+JNI_LIB_DIR="${ROOT}/app/build/ffmpeg/jniLibs/arm64-v8a"
 
 NDK="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}"
 if [[ -z "${NDK}" ]]; then
@@ -44,7 +45,7 @@ export STRIP="${TOOLCHAIN}/bin/llvm-strip"
 export NM="${TOOLCHAIN}/bin/llvm-nm"
 SYSROOT="${TOOLCHAIN}/sysroot"
 
-mkdir -p "$(dirname "${FFMPEG_DIR}")" "${PREFIX}"
+mkdir -p "$(dirname "${FFMPEG_DIR}")" "${PREFIX}" "${JNI_LIB_DIR}"
 if [[ ! -d "${FFMPEG_DIR}/.git" ]]; then
   rm -rf "${FFMPEG_DIR}"
   git init "${FFMPEG_DIR}"
@@ -100,6 +101,9 @@ for library in libavcodec.so libavutil.so libswscale.so; do
     echo "Bibliothèque FFmpeg manquante après installation : ${PREFIX}/lib/${library}" >&2
     exit 1
   fi
+  # Android packages native libraries from an ABI-named directory. Copy the
+  # resolved shared object (not a symlink) so APK packaging remains portable.
+  cp -L "${PREFIX}/lib/${library}" "${JNI_LIB_DIR}/${library}"
 done
 
 echo "FFmpeg ${FFMPEG_COMMIT} compilé pour arm64-v8a dans ${PREFIX}"
