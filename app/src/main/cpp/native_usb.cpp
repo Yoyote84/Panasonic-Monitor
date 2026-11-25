@@ -24,6 +24,8 @@
 namespace {
 
 constexpr uint8_t kUsbClassVideo = 0x0E;
+constexpr uint8_t kUvcHeaderPts = 0x04;
+constexpr uint8_t kUvcHeaderScr = 0x08;
 constexpr uint8_t kUsbSubclassVideoStreaming = 0x02;
 constexpr uint8_t kCsInterface = 0x24;
 constexpr uint8_t kVsFormatMjpeg = 0x06;
@@ -304,6 +306,7 @@ struct IsoStats {
     uint64_t rawBytes = 0;
     uint64_t packetErrors = 0;
     uint64_t uvcErrorFlags = 0;
+    uint64_t malformedUvcHeaders = 0;
     int submitErrors = 0;
 };
 
@@ -338,16 +341,22 @@ void LIBUSB_CALL isoCallback(libusb_transfer* transfer) {
             const unsigned int actual = packet.actual_length;
             if (data != nullptr && actual >= 2) {
                 const unsigned int headerLength = data[0];
-                if (headerLength >= 2 && headerLength <= actual) {
-                    if ((data[1] & 0x40) != 0) {
+                const unsigned char flags = data[1];
+                const unsigned int minimumHeaderLength = 2U
+                        + ((flags & kUvcHeaderPts) != 0 ? 4U : 0U)
+                        + ((flags & kUvcHeaderScr) != 0 ? 6U : 0U);
+                if (headerLength >= minimumHeaderLength && headerLength <= actual) {
+                    if ((flags & 0x40) != 0) {
                         ++stats->uvcErrorFlags;
                     }
                     stats->payloadBytes += actual - headerLength;
                     if (stats->preview != nullptr) {
-                        // Copy into a bounded ring only; decoding and rendering
-                        // never run on libusb's isochronous event thread.
+                        // Header-only payloads are forwarded too, as they can
+                        // carry EOF/FID even when video data is absent.
                         stats->preview->pushUvcPacket(data, actual);
                     }
+                } else {
+                    ++stats->malformedUvcHeaders;
                 }
             }
         }
@@ -499,8 +508,14 @@ std::string runProbe(int fd, int selectedMode, int durationMs,
                      ANativeWindow* previewWindow = nullptr,
                      std::atomic<bool>* stopRequested = nullptr) {
     std::ostringstream report;
-    report << "PANASONIC MONITOR — TEST TRANSPORT NATIF\n";
+    report << "PANASONIC MONITOR — "
+           << (previewWindow != nullptr ? "APERÇU VIDÉO ÉTAPE 3" : "TEST TRANSPORT NATIF")
+           << "\n";
     report << "Moteur demandé : " << (selectedMode == 1 ? "Monitor DV / Motion DV" : "Webcam") << "\n";
+    if (previewWindow != nullptr) {
+        report << "Prétraitement interne automatique : validation UVC, reconstruction des trames, "
+                  "décodage FFmpeg et rendu Android. Aucun flux vidéo synthétique n'est utilisé.\n";
+    }
     report << "libusb : version Android native (wrap_sys_device)\n";
 
     if (fd < 0) {
@@ -795,6 +810,7 @@ std::string runProbe(int fd, int selectedMode, int durationMs,
         report << "Paquets avec données : " << stats.packetsWithData << "\n";
         report << "Octets USB reçus : " << stats.rawBytes << "\n";
         report << "Octets de payload UVC : " << stats.payloadBytes << "\n";
+        report << "En-têtes UVC mal formés : " << stats.malformedUvcHeaders << "\n";
         report << "Flags d'erreur UVC : " << stats.uvcErrorFlags << "\n";
         report << "Erreurs de paquets / soumission : "
                << stats.packetErrors << " / " << stats.submitErrors << "\n";
@@ -802,7 +818,8 @@ std::string runProbe(int fd, int selectedMode, int durationMs,
         if (received) {
             report << "RÉSULTAT : le transport isochrone a livré des données au téléphone.\n";
             if (previewWindow != nullptr) {
-                report << "Le flux a été confié au décodeur ; vérifie le compteur d'images affichées.\n";
+                report << "Le flux réel a traversé le moteur interne de reconstruction et de décodage.\n";
+                report << "Consulte les compteurs Images décodées / affichées pour confirmer le rendu.\n";
                 report << "La synchronisation audio/vidéo reste à valider.\n";
             } else {
                 report << "Cela valide le transport, pas encore le décodage ou la synchronisation A/V.\n";
