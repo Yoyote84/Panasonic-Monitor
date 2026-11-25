@@ -303,9 +303,14 @@ public class MainActivity extends Activity {
         scroll.setFillViewport(true);
         scroll.addView(reportView);
         root.addView(scroll, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(180)));
 
-        setContentView(root);
+        // The preview surface and all controls stay reachable on the Z Flip's
+        // portrait layout; the whole page scrolls instead of clipping buttons.
+        ScrollView pageScroll = new ScrollView(this);
+        pageScroll.setFillViewport(true);
+        pageScroll.addView(root);
+        setContentView(pageScroll);
     }
 
     private LinearLayout.LayoutParams fullWidthButton() {
