@@ -513,11 +513,7 @@ std::string runProbe(int fd, int selectedMode, int durationMs) {
 
     report << "USB VID:PID : " << std::hex << std::uppercase
            << deviceDescriptor.idVendor << ":" << deviceDescriptor.idProduct
-           << std::dec << "\n";
-
-    report << "PID USB : " << std::hex << std::uppercase
-           << deviceDescriptor.idProduct << std::dec
-           << " (informatif uniquement ; moteur choisi par le format UVC).\n";
+           << std::dec << " (PID informatif ; moteur choisi par le format UVC).\n";
     if (deviceDescriptor.idVendor != kPanasonicVid) {
         report << "Le VID du périphérique n'est pas Panasonic.\n";
         goto cleanup;
@@ -535,7 +531,8 @@ std::string runProbe(int fd, int selectedMode, int durationMs) {
     if (!findModeFormat(config, wantDv, format, report)) {
         report << "Aucun descripteur UVC " << (wantDv ? "VS_FORMAT_DV" : "VS_FORMAT_MJPEG")
                << " trouvé dans la configuration active.\n";
-        report << "Le mode Webcam devra être vérifié avec son rapport de descripteurs complet.\n";
+        report << "Vérifie que le mode USB du caméscope annonce le format demandé. "
+               << "Le moteur n'est pas déduit du VID/PID.\n";
         goto cleanup;
     }
 
