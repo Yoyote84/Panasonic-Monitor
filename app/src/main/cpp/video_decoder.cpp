@@ -1,4 +1,5 @@
 #include "video_decoder.h"
+#include "uvc_frame_assembler.h"
 
 #include <android/native_window.h>
 
@@ -26,8 +27,8 @@ namespace {
 constexpr size_t kPreviewRingBytes = 8U * 1024U * 1024U;
 constexpr size_t kWorkerChunkBytes = 32U * 1024U;
 constexpr size_t kMaximumMjpegFrameBytes = 8U * 1024U * 1024U;
-constexpr uint8_t kUvcFid = 0x01;
-constexpr uint8_t kUvcEof = 0x02;
+constexpr uint8_t kUvcPts = 0x04;
+constexpr uint8_t kUvcScr = 0x08;
 constexpr uint8_t kUvcErr = 0x40;
 
 /** Single-producer/single-consumer byte ring. The libusb callback never waits. */
@@ -173,8 +174,13 @@ struct PreviewDecoder::Impl {
         }
 
         if (dvMode) {
-            dvFrame.clear();
-            dvFrame.reserve(negotiatedFrameSize);
+            if (negotiatedFrameSize == 0) {
+                error = "Le périphérique n'a pas négocié de taille de trame DV.";
+                return false;
+            }
+            dvAssembler = panasonic::UvcFrameAssembler(
+                    negotiatedFrameSize,
+                    panasonic::UvcFrameAssembler::Policy::ExactSize);
         }
         stopping.store(false, std::memory_order_release);
         running.store(true, std::memory_order_release);
@@ -197,12 +203,14 @@ struct PreviewDecoder::Impl {
         }
 
         const size_t headerLength = data[0];
-        if (headerLength < 2 || headerLength > length) {
+        const uint8_t flags = data[1];
+        const size_t minimumHeaderLength = 2U
+                + ((flags & kUvcPts) != 0 ? 4U : 0U)
+                + ((flags & kUvcScr) != 0 ? 6U : 0U);
+        if (headerLength < minimumHeaderLength || headerLength > length) {
             malformedHeaders.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
-
-        const uint8_t flags = data[1];
         if ((flags & kUvcErr) != 0) {
             // Panasonic marks some valid DV payload during tape-tract lock.
             // Keep the bytes; the DV decoder decides whether a frame is usable.
@@ -211,11 +219,9 @@ struct PreviewDecoder::Impl {
 
         const uint8_t* payload = data + headerLength;
         const size_t payloadLength = length - headerLength;
-        if (payloadLength == 0) return true;
 
-        // Preserve the UVC payload-header flags for both DV and MJPEG.
-        // FID is mandatory for frame-based formats such as DV; EOF is optional.
-        // Frame assembly remains on the worker thread, never in the USB callback.
+        // Preserve header-only UVC payloads too: they can carry EOF/FID even
+        // when no video bytes are present. Assembly runs on the worker thread.
         constexpr size_t kRecordHeader = 3;
         if (payloadLength > std::numeric_limits<uint16_t>::max()) {
             queueDrops.fetch_add(1, std::memory_order_relaxed);
@@ -229,7 +235,9 @@ struct PreviewDecoder::Impl {
         record[0] = flags;
         record[1] = static_cast<uint8_t>(payloadLength & 0xFF);
         record[2] = static_cast<uint8_t>((payloadLength >> 8) & 0xFF);
-        std::memcpy(record.data() + kRecordHeader, payload, payloadLength);
+        if (payloadLength > 0) {
+            std::memcpy(record.data() + kRecordHeader, payload, payloadLength);
+        }
         const bool written = ring.write(record.data(), payloadLength + kRecordHeader);
 
         if (!written) {
@@ -270,6 +278,13 @@ struct PreviewDecoder::Impl {
         out << "Erreurs de décodage / affichage : "
             << decodeErrors.load(std::memory_order_relaxed) << " / "
             << renderErrors.load(std::memory_order_relaxed) << "\n";
+        const auto frameStats = dvMode
+                ? dvAssembler.statistics() : jpegAssembler.statistics();
+        out << "Trames complètes reconstruites : " << frameStats.completedFrames << "\n";
+        out << "Trames incomplètes rejetées : " << frameStats.incompleteFrames << "\n";
+        out << "Trames trop volumineuses rejetées : " << frameStats.oversizedFrames << "\n";
+        out << "Payloads ignorés après EOF (même FID) : " << frameStats.payloadsAfterEof << "\n";
+        out << "Resynchronisations après perte de tampon : " << frameStats.resyncDrops << "\n";
         if (!lastError.empty()) {
             out << "Dernier détail : " << lastError << "\n";
         }
@@ -281,6 +296,9 @@ private:
         std::array<uint8_t, kWorkerChunkBytes> chunk{};
         std::vector<uint8_t> uvcRecords;
         uvcRecords.reserve(64U * 1024U);
+        const auto onFrame = [this](const std::vector<uint8_t>& frame) {
+            decodeFrame(frame.data(), frame.size());
+        };
 
         while (!stopping.load(std::memory_order_acquire) || ring.available() > 0) {
             const size_t count = ring.read(chunk.data(), chunk.size());
@@ -291,6 +309,7 @@ private:
 
             if (resyncRequested.exchange(false, std::memory_order_acq_rel)) {
                 resetAssemblers();
+                uvcRecords.clear();
             }
 
             uvcRecords.insert(uvcRecords.end(), chunk.begin(),
@@ -301,17 +320,15 @@ private:
                 consumeMjpegRecords(uvcRecords);
             }
         }
-        // Deliberately discard an incomplete final frame on stop. A partial
-        // DV/JPEG buffer must never be presented as a valid image.
+
+        // Keep a complete last DV frame even without EOF; MJPEG needs EOI.
+        if (dvMode) dvAssembler.flushAtStop(onFrame);
+        else jpegAssembler.flushAtStop(onFrame, true);
     }
 
     void resetAssemblers() {
-        dvFrame.clear();
-        dvFid = -1;
-        dvDropUntilBoundary = false;
-        jpegFrame.clear();
-        jpegFid = -1;
-        jpegDropUntilBoundary = false;
+        dvAssembler.resync();
+        jpegAssembler.resync();
     }
 
     void consumeDvRecords(std::vector<uint8_t>& records) {
@@ -325,10 +342,8 @@ private:
             if (records.size() - consumed < kRecordHeader + payloadLength) {
                 break;
             }
-            if (payloadLength > 0) {
-                pushDvPayload(flags, records.data() + consumed + kRecordHeader,
-                              payloadLength);
-            }
+            pushDvPayload(flags, records.data() + consumed + kRecordHeader,
+                          payloadLength);
             consumed += kRecordHeader + payloadLength;
         }
 
@@ -338,59 +353,16 @@ private:
         }
         if (records.size() > 2U * 1024U * 1024U) {
             records.clear();
-            dvFrame.clear();
-            dvDropUntilBoundary = true;
+            dvAssembler.resync();
             assemblyDrops.fetch_add(1, std::memory_order_relaxed);
         }
-    }
-
-    void finishDvFrame() {
-        if (dvDropUntilBoundary) {
-            dvFrame.clear();
-            dvDropUntilBoundary = false;
-            return;
-        }
-        if (dvFrame.empty()) {
-            return;
-        }
-
-        if (dvFrame.size() == negotiatedFrameSize) {
-            decodeFrame(dvFrame.data(), dvFrame.size());
-        } else {
-            // Never send a truncated or overrun DV frame to FFmpeg.
-            assemblyDrops.fetch_add(1, std::memory_order_relaxed);
-        }
-        dvFrame.clear();
     }
 
     void pushDvPayload(uint8_t flags, const uint8_t* payload, size_t length) {
-        const int fid = (flags & kUvcFid) != 0 ? 1 : 0;
-
-        if (dvFid < 0) {
-            dvFid = fid;
-        } else if (fid != dvFid) {
-            // UVC FID toggles at the beginning of each frame. It is the
-            // mandatory frame boundary for frame-based formats such as DV.
-            finishDvFrame();
-            dvFid = fid;
-        }
-
-        if (!dvDropUntilBoundary) {
-            if (dvFrame.size() > negotiatedFrameSize
-                    || length > negotiatedFrameSize - dvFrame.size()) {
-                dvFrame.clear();
-                dvDropUntilBoundary = true;
-                assemblyDrops.fetch_add(1, std::memory_order_relaxed);
-            } else {
-                dvFrame.insert(dvFrame.end(), payload, payload + length);
-            }
-        }
-
-        // EOF is optional in UVC. Use it when supplied, while keeping FID
-        // toggling as the fallback boundary for devices that omit EOF.
-        if ((flags & kUvcEof) != 0) {
-            finishDvFrame();
-        }
+        dvAssembler.push(flags, payload, length,
+                [this](const std::vector<uint8_t>& frame) {
+                    decodeFrame(frame.data(), frame.size());
+                });
     }
 
     void consumeMjpegRecords(std::vector<uint8_t>& records) {
@@ -404,10 +376,8 @@ private:
             if (records.size() - consumed < kRecordHeader + payloadLength) {
                 break;
             }
-            if (payloadLength > 0) {
-                pushMjpegPayload(flags, records.data() + consumed + kRecordHeader,
-                                 payloadLength);
-            }
+            pushMjpegPayload(flags, records.data() + consumed + kRecordHeader,
+                             payloadLength);
             consumed += kRecordHeader + payloadLength;
         }
 
@@ -417,42 +387,16 @@ private:
         }
         if (records.size() > 2U * 1024U * 1024U) {
             records.clear();
-            jpegFrame.clear();
-            jpegDropUntilBoundary = true;
+            jpegAssembler.resync();
             assemblyDrops.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
     void pushMjpegPayload(uint8_t flags, const uint8_t* payload, size_t length) {
-        const int fid = (flags & kUvcFid) != 0 ? 1 : 0;
-        if (jpegFid < 0) {
-            jpegFid = fid;
-        } else if (fid != jpegFid) {
-            if (!jpegDropUntilBoundary && !jpegFrame.empty()) {
-                decodeFrame(jpegFrame.data(), jpegFrame.size());
-            }
-            jpegFrame.clear();
-            jpegDropUntilBoundary = false;
-            jpegFid = fid;
-        }
-
-        if (!jpegDropUntilBoundary) {
-            if (length > kMaximumMjpegFrameBytes - jpegFrame.size()) {
-                jpegFrame.clear();
-                jpegDropUntilBoundary = true;
-                assemblyDrops.fetch_add(1, std::memory_order_relaxed);
-            } else {
-                jpegFrame.insert(jpegFrame.end(), payload, payload + length);
-            }
-        }
-
-        if ((flags & kUvcEof) != 0) {
-            if (!jpegDropUntilBoundary && !jpegFrame.empty()) {
-                decodeFrame(jpegFrame.data(), jpegFrame.size());
-            }
-            jpegFrame.clear();
-            jpegDropUntilBoundary = false;
-        }
+        jpegAssembler.push(flags, payload, length,
+                [this](const std::vector<uint8_t>& frame) {
+                    decodeFrame(frame.data(), frame.size());
+                });
     }
 
     void decodeFrame(const uint8_t* bytes, size_t length) {
@@ -585,13 +529,11 @@ private:
     AVFrame* decodedFrame = nullptr;
     SwsContext* sws = nullptr;
 
-    std::vector<uint8_t> dvFrame;
-    int dvFid = -1;
-    bool dvDropUntilBoundary = false;
-
-    std::vector<uint8_t> jpegFrame;
-    int jpegFid = -1;
-    bool jpegDropUntilBoundary = false;
+    panasonic::UvcFrameAssembler dvAssembler{
+            0, panasonic::UvcFrameAssembler::Policy::ExactSize};
+    panasonic::UvcFrameAssembler jpegAssembler{
+            kMaximumMjpegFrameBytes,
+            panasonic::UvcFrameAssembler::Policy::UpToMaximum};
 
     std::atomic<uint64_t> payloadBytes{0};
     std::atomic<uint64_t> decodedFrames{0};
