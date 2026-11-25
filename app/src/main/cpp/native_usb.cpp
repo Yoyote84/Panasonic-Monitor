@@ -7,6 +7,8 @@
 #include <cstring>
 #include <sstream>
 #include <string>
+#include <new>
+#include <sys/time.h>
 #include <vector>
 #include <unistd.h>
 
@@ -451,8 +453,9 @@ std::string runProbe(int fd, int selectedMode, int durationMs) {
 
     bool interfaceClaimed = false;
     libusb_config_descriptor* config = nullptr;
-
     libusb_device_descriptor deviceDescriptor {};
+    const bool wantDv = selectedMode == 1;
+    UvcFormat format;
     result = libusb_get_device_descriptor(libusb_get_device(handle), &deviceDescriptor);
     if (result != LIBUSB_SUCCESS) {
         report << describeError("libusb_get_device_descriptor", result) << "\n";
@@ -478,8 +481,6 @@ std::string runProbe(int fd, int selectedMode, int durationMs) {
         goto cleanup;
     }
 
-    UvcFormat format;
-    const bool wantDv = selectedMode == 1;
     if (!findModeFormat(config, wantDv, format, report)) {
         report << "Aucun descripteur UVC " << (wantDv ? "VS_FORMAT_DV" : "VS_FORMAT_MJPEG")
                << " trouvé dans la configuration active.\n";
