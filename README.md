@@ -80,6 +80,50 @@ La version 0.2.1 ajoute ou corrige :
 - `Flags d'erreur UVC` : paquets marqués en erreur par le périphérique ; ce compteur n'est pas à lui seul une mesure de corruption d'image.
 - Aucun payload : vérifier la personnalité USB, le mode caméra/lecture, l'alimentation et le câble. Cela ne prouve pas à lui seul que le format est incompatible.
 
+## Étape 3 — Décodage et aperçu vidéo en direct
+
+Cette branche ouvre le travail de l'étape 3 sans déclarer l'étape 2 terminée. Le transport DV a déjà livré un payload réel sur le Galaxy Z Flip 6 ; la réservation Webcam MJPEG reste bloquée par `EBUSY` dans le dernier rapport matériel.
+
+### Chaîne vidéo ajoutée
+
+- Le transport libusb conserve les transferts isochrones et transmet chaque paquet UVC avec son en-tête au décodeur.
+- Le callback USB ne décode pas : il copie les données dans un tampon circulaire SPSC borné de 8 Mio. En cas de saturation, les pertes sont comptées et l'assembleur est resynchronisé.
+- Un moteur interne de compatibilité prépare automatiquement le flux réel : vérification de l'en-tête UVC (y compris les champs PTS/SCR optionnels), conservation des indicateurs FID/EOF, reconstruction des trames puis transmission à FFmpeg. Il ne génère aucune image de remplacement et n'ajoute aucun mode simulateur.
+- L'assembleur commun traite `EOF` comme frontière prioritaire et utilise le changement de `FID` comme repli si EOF manque. Après un EOF, les payloads portant encore le même FID sont ignorés jusqu'au FID suivant, afin d'éviter de créer une seconde trame avec des fragments résiduels.
+- Les paquets UVC contenant uniquement leur en-tête sont conservés : ils peuvent porter un EOF/FID utile même sans octets vidéo.
+- Pour DV, une trame n'est envoyée à FFmpeg que si sa taille correspond exactement à la taille négociée par PROBE (DV25 classique : 144 000 octets PAL ou 120 000 NTSC). Les trames incomplètes ou trop longues sont rejetées avant FFmpeg.
+- Les images MJPEG sont assemblées par le même mécanisme FID/EOF, avec une limite mémoire stricte de 8 Mio et une dernière vérification EOI si le flux s'arrête sans signal EOF.
+- En cas de saturation du tampon, le moteur efface aussi tout enregistrement partiel du parseur et attend le prochain changement FID avant de reprendre, sans assembler des données provenant d'avant et d'après la perte.
+- À l'arrêt, le dernier paquet DV n'est transmis que si sa taille exacte est atteinte ; une trame MJPEG sans EOF n'est acceptée que si son marqueur JPEG EOI est présent.
+- FFmpeg 9.1 décode DV/MJPEG ; libswscale convertit les images en RGBA et une Surface Android les affiche.
+- L'arrêt annule les transferts isochrones, attend leurs callbacks, vide le tampon restant et ferme l'interface avant de libérer le descripteur USB.
+- Les paquets marqués UVC ERR sont conservés : ces bits peuvent être présents sur des payloads DV exploitables pendant la synchronisation de lecture.
+
+Le mode aperçu est continu jusqu'à ce que l'utilisateur appuie sur **Arrêter l'aperçu** ou que l'activité perde son écran. La détection USB et le test de transport de cinq secondes restent disponibles pour le diagnostic.
+
+### Compilation FFmpeg Android
+
+Le workflow compile FFmpeg 9.1 depuis le commit amont exact `74e4393595cf2b5857f0da925c4e0dd74ea306e5`, cible `arm64-v8a`, puis génère l'APK :
+
+```bash
+export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.2.12479018"
+bash scripts/build-ffmpeg-android.sh
+gradle :app:testDebugUnitTest :app:assembleDebug
+```
+
+La compilation utilise les bibliothèques partagées LGPL et n'active ni les composants GPL ni les composants non-free. Voir [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) et [la licence FFmpeg](licenses/FFmpeg-COPYING.LGPLv2.1).
+
+### Validation matérielle encore nécessaire
+
+1. Sur le NV-GS140, choisir **Motion DV**, passer en VCR/lecture et lancer une cassette.
+2. Dans l'application, choisir **Monitor DV / Motion DV**, détecter le caméscope, puis démarrer l'aperçu.
+3. Confirmer que l'image apparaît et reste fluide pendant plusieurs minutes.
+4. Arrêter l'aperçu et partager le rapport : trames décodées/affichées, pertes de tampon, flags ERR, erreurs de décodage et libération libusb.
+5. Refaire l'essai après débranchement/rebranchement.
+6. Répéter en Webcam MJPEG après résolution du conflit `EBUSY`.
+
+**Validation restante :** les tests natifs automatisés couvrent désormais les frontières EOF/FID, les paquets d'en-tête seuls, les trames tronquées/surdimensionnées, la resynchronisation après perte de tampon et la dernière trame à l'arrêt. La CI doit valider cette révision. Le décodage et l'affichage réels doivent toujours être vérifiés sur le NV-GS140 + Galaxy Z Flip 6. Le flux audio USB et la synchronisation A/V ne sont pas encore implémentés ; aucun enregistrement DV/MP4 n'est encore produit. L'étape 3 reste donc en cours.
+
 ## Compilation
 
 Le workflow GitHub Actions compile les tests Java et l'APK arm64 avec JDK 17, Android SDK 35, NDK 27.2.12479018, CMake 3.22.1 et Gradle 8.13.
@@ -103,6 +147,6 @@ APK : `app/build/outputs/apk/debug/app-debug.apk`
 
 1. Diagnostic USB et identification des formats annoncés par le NV-GS140 — réalisé avec les rapports de test.
 2. Transport natif UVC-DV / Webcam et échantillonnage isochrone — transport DV validé sur matériel ; correction du nettoyage libusb poussée ; validation Webcam MJPEG et nouveau test de libération/reconnexion encore requis.
-3. Décodage, aperçu en direct et synchronisation audio/vidéo.
+3. Décodage et aperçu en direct — moteur interne de préparation UVC/DV, assembleur FID/EOF corrigé, tests de régression natifs ajoutés ; validation vidéo matérielle et audio/A-V encore requises.
 4. Enregistrement DV original, MP4 et bibliothèque de médias.
 5. Stabilité, reconnexion, optimisation, tests finaux et APK final.

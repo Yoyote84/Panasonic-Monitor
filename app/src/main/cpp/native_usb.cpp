@@ -1,7 +1,11 @@
 #include <jni.h>
 #include <libusb.h>
+#include <android/native_window_jni.h>
+#include "video_decoder.h"
 
 #include <algorithm>
+#include <atomic>
+#include <memory>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -20,6 +24,8 @@
 namespace {
 
 constexpr uint8_t kUsbClassVideo = 0x0E;
+constexpr uint8_t kUvcHeaderPts = 0x04;
+constexpr uint8_t kUvcHeaderScr = 0x08;
 constexpr uint8_t kUsbSubclassVideoStreaming = 0x02;
 constexpr uint8_t kCsInterface = 0x24;
 constexpr uint8_t kVsFormatMjpeg = 0x06;
@@ -291,6 +297,7 @@ IsoEndpoint selectIsoEndpoint(libusb_config_descriptor* config,
 }
 
 struct IsoStats {
+    PreviewDecoder* preview = nullptr;
     bool stopping = false;
     int inFlight = 0;
     uint64_t completedPackets = 0;
@@ -299,6 +306,7 @@ struct IsoStats {
     uint64_t rawBytes = 0;
     uint64_t packetErrors = 0;
     uint64_t uvcErrorFlags = 0;
+    uint64_t malformedUvcHeaders = 0;
     int submitErrors = 0;
 };
 
@@ -333,11 +341,22 @@ void LIBUSB_CALL isoCallback(libusb_transfer* transfer) {
             const unsigned int actual = packet.actual_length;
             if (data != nullptr && actual >= 2) {
                 const unsigned int headerLength = data[0];
-                if (headerLength >= 2 && headerLength <= actual) {
-                    if ((data[1] & 0x40) != 0) {
+                const unsigned char flags = data[1];
+                const unsigned int minimumHeaderLength = 2U
+                        + ((flags & kUvcHeaderPts) != 0 ? 4U : 0U)
+                        + ((flags & kUvcHeaderScr) != 0 ? 6U : 0U);
+                if (headerLength >= minimumHeaderLength && headerLength <= actual) {
+                    if ((flags & 0x40) != 0) {
                         ++stats->uvcErrorFlags;
                     }
                     stats->payloadBytes += actual - headerLength;
+                    if (stats->preview != nullptr) {
+                        // Header-only payloads are forwarded too, as they can
+                        // carry EOF/FID even when video data is absent.
+                        stats->preview->pushUvcPacket(data, actual);
+                    }
+                } else {
+                    ++stats->malformedUvcHeaders;
                 }
             }
         }
@@ -361,7 +380,10 @@ bool runIsoSample(libusb_context* ctx,
                   const IsoEndpoint& endpoint,
                   int durationMs,
                   IsoStats& stats,
-                  std::ostringstream& report) {
+                  std::ostringstream& report,
+                  PreviewDecoder* preview = nullptr,
+                  std::atomic<bool>* stopRequested = nullptr) {
+    stats.preview = preview;
     std::vector<libusb_transfer*> transfers;
     std::vector<TransferState> states(kTransferCount);
     transfers.reserve(kTransferCount);
@@ -435,9 +457,11 @@ bool runIsoSample(libusb_context* ctx,
 
     const auto endTime = std::chrono::steady_clock::now()
                        + std::chrono::milliseconds(durationMs);
-    while (std::chrono::steady_clock::now() < endTime &&
+    while ((durationMs < 0 || std::chrono::steady_clock::now() < endTime) &&
            stats.inFlight > 0 &&
-           stats.submitErrors == 0) {
+           stats.submitErrors == 0 &&
+           (stopRequested == nullptr ||
+            !stopRequested->load(std::memory_order_acquire))) {
         timeval timeout {};
         timeout.tv_sec = 0;
         timeout.tv_usec = 100000;
@@ -480,10 +504,18 @@ bool runIsoSample(libusb_context* ctx,
     return stats.payloadBytes > 0;
 }
 
-std::string runProbe(int fd, int selectedMode, int durationMs) {
+std::string runProbe(int fd, int selectedMode, int durationMs,
+                     ANativeWindow* previewWindow = nullptr,
+                     std::atomic<bool>* stopRequested = nullptr) {
     std::ostringstream report;
-    report << "PANASONIC MONITOR — TEST TRANSPORT NATIF\n";
+    report << "PANASONIC MONITOR — "
+           << (previewWindow != nullptr ? "APERÇU VIDÉO ÉTAPE 3" : "TEST TRANSPORT NATIF")
+           << "\n";
     report << "Moteur demandé : " << (selectedMode == 1 ? "Monitor DV / Motion DV" : "Webcam") << "\n";
+    if (previewWindow != nullptr) {
+        report << "Prétraitement interne automatique : validation UVC, reconstruction des trames, "
+                  "décodage FFmpeg et rendu Android. Aucun flux vidéo synthétique n'est utilisé.\n";
+    }
     report << "libusb : version Android native (wrap_sys_device)\n";
 
     if (fd < 0) {
@@ -527,6 +559,7 @@ std::string runProbe(int fd, int selectedMode, int durationMs) {
     libusb_device_descriptor deviceDescriptor {};
     const bool wantDv = selectedMode == 1;
     UvcFormat format;
+    std::unique_ptr<PreviewDecoder> preview;
     result = libusb_get_device_descriptor(libusb_get_device(handle), &deviceDescriptor);
     if (result != LIBUSB_SUCCESS) {
         report << describeError("libusb_get_device_descriptor", result) << "\n";
@@ -745,22 +778,52 @@ std::string runProbe(int fd, int selectedMode, int durationMs) {
                << " · endpoint IN 0x" << std::hex
                << static_cast<int>(endpoint.address) << std::dec
                << " · paquet " << endpoint.packetCapacity << " octets\n";
-        report << "Échantillonnage isochrone : " << durationMs << " ms"
-               << " · " << kTransferCount << " transferts\n";
+        if (previewWindow != nullptr) {
+            preview.reset(new PreviewDecoder(wantDv, maxFrameSize, previewWindow));
+            std::string decoderError;
+            if (!preview->start(decoderError)) {
+                report << "Démarrage du décodeur / aperçu impossible : "
+                       << decoderError << "\n";
+                goto cleanup;
+            }
+            report << "Aperçu vidéo en direct : décodage FFmpeg actif.\n";
+        }
+
+        if (durationMs < 0) {
+            report << "Flux isochrone continu : arrêt manuel depuis Android"
+                   << " · " << kTransferCount << " transferts\n";
+        } else {
+            report << "Échantillonnage isochrone : " << durationMs << " ms"
+                   << " · " << kTransferCount << " transferts\n";
+        }
 
         IsoStats stats;
-        const bool received = runIsoSample(ctx, handle, endpoint, durationMs, stats, report);
+        const bool received = runIsoSample(ctx, handle, endpoint, durationMs,
+                                           stats, report, preview.get(),
+                                           previewWindow != nullptr ? stopRequested : nullptr);
+        if (preview != nullptr) {
+            preview->stop();
+            report << preview->summary();
+            preview.reset();
+        }
         report << "Paquets complétés : " << stats.completedPackets << "\n";
         report << "Paquets avec données : " << stats.packetsWithData << "\n";
         report << "Octets USB reçus : " << stats.rawBytes << "\n";
         report << "Octets de payload UVC : " << stats.payloadBytes << "\n";
+        report << "En-têtes UVC mal formés : " << stats.malformedUvcHeaders << "\n";
         report << "Flags d'erreur UVC : " << stats.uvcErrorFlags << "\n";
         report << "Erreurs de paquets / soumission : "
                << stats.packetErrors << " / " << stats.submitErrors << "\n";
 
         if (received) {
             report << "RÉSULTAT : le transport isochrone a livré des données au téléphone.\n";
-            report << "Cela valide le transport, pas encore le décodage ou la synchronisation A/V.\n";
+            if (previewWindow != nullptr) {
+                report << "Le flux réel a traversé le moteur interne de reconstruction et de décodage.\n";
+                report << "Consulte les compteurs Images décodées / affichées pour confirmer le rendu.\n";
+                report << "La synchronisation audio/vidéo reste à valider.\n";
+            } else {
+                report << "Cela valide le transport, pas encore le décodage ou la synchronisation A/V.\n";
+            }
         } else {
             report << "RÉSULTAT : aucun payload vidéo reçu pendant l'échantillonnage.\n";
             if (wantDv) {
@@ -805,6 +868,10 @@ cleanup:
 
 }  // namespace
 
+namespace {
+std::atomic<bool> gPreviewStopRequested{false};
+}
+
 extern "C" JNIEXPORT jstring JNICALL
 Java_fr_panasonic_monitor_MainActivity_nativeProbeAndSample(
         JNIEnv* env, jobject /* thiz */, jint usbFileDescriptor,
@@ -815,5 +882,38 @@ Java_fr_panasonic_monitor_MainActivity_nativeProbeAndSample(
             static_cast<int>(usbFileDescriptor),
             static_cast<int>(mode),
             safeDuration);
+    return env->NewStringUTF(result.c_str());
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_fr_panasonic_monitor_MainActivity_nativePreparePreview(
+        JNIEnv* /* env */, jobject /* thiz */) {
+    gPreviewStopRequested.store(false, std::memory_order_release);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_fr_panasonic_monitor_MainActivity_nativeStopPreview(
+        JNIEnv* /* env */, jobject /* thiz */) {
+    gPreviewStopRequested.store(true, std::memory_order_release);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_fr_panasonic_monitor_MainActivity_nativeStartPreview(
+        JNIEnv* env, jobject /* thiz */, jint usbFileDescriptor,
+        jint mode, jobject surface) {
+    if (surface == nullptr) {
+        return env->NewStringUTF("Surface Android manquante.\n");
+    }
+    ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
+    if (window == nullptr) {
+        return env->NewStringUTF("Impossible d'ouvrir la Surface Android.\n");
+    }
+    const std::string result = runProbe(
+            static_cast<int>(usbFileDescriptor),
+            static_cast<int>(mode),
+            -1,
+            window,
+            &gPreviewStopRequested);
+    ANativeWindow_release(window);
     return env->NewStringUTF(result.c_str());
 }

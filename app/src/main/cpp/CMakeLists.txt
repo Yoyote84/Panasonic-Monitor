@@ -4,8 +4,7 @@ project(panasonic_monitor_native LANGUAGES C CXX)
 include(FetchContent)
 
 # Pinned libusb-cmake wrapper. Its lock file pins the bundled upstream libusb
-# source revision to ed4caebb6869f4504d0c5f86abed3ba9381ac4dc
-# (libusb v1.0.30-56-g...). This avoids a floating dependency.
+# source revision to ed4caebb6869f4504d0c5f86abed3ba9381ac4dc.
 set(LIBUSB_BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
 set(LIBUSB_BUILD_TESTING OFF CACHE BOOL "" FORCE)
 set(LIBUSB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -21,7 +20,46 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(libusb_cmake)
 
-add_library(panasonic_usb SHARED native_usb.cpp)
+set(FFMPEG_ROOT "" CACHE PATH "FFmpeg Android arm64-v8a prefix")
+if(NOT FFMPEG_ROOT)
+    message(FATAL_ERROR "FFMPEG_ROOT must point to the pinned Android FFmpeg build")
+endif()
+
+set(FFMPEG_INCLUDE_DIR "${FFMPEG_ROOT}/include")
+set(FFMPEG_AVCODEC "${FFMPEG_ROOT}/lib/libavcodec.so")
+set(FFMPEG_AVUTIL "${FFMPEG_ROOT}/lib/libavutil.so")
+set(FFMPEG_SWSCALE "${FFMPEG_ROOT}/lib/libswscale.so")
+
+foreach(required_path
+        "${FFMPEG_INCLUDE_DIR}/libavcodec/avcodec.h"
+        "${FFMPEG_INCLUDE_DIR}/libavutil/avutil.h"
+        "${FFMPEG_INCLUDE_DIR}/libswscale/swscale.h"
+        "${FFMPEG_AVCODEC}"
+        "${FFMPEG_AVUTIL}"
+        "${FFMPEG_SWSCALE}")
+    if(NOT EXISTS "${required_path}")
+        message(FATAL_ERROR "FFmpeg Android artifact missing: ${required_path}. Run scripts/build-ffmpeg-android.sh first.")
+    endif()
+endforeach()
+
+message(STATUS "Using pinned FFmpeg headers and shared libraries from ${FFMPEG_ROOT}")
+
+add_library(ffmpeg_avcodec SHARED IMPORTED)
+set_target_properties(ffmpeg_avcodec PROPERTIES IMPORTED_LOCATION "${FFMPEG_AVCODEC}")
+add_library(ffmpeg_avutil SHARED IMPORTED)
+set_target_properties(ffmpeg_avutil PROPERTIES IMPORTED_LOCATION "${FFMPEG_AVUTIL}")
+add_library(ffmpeg_swscale SHARED IMPORTED)
+set_target_properties(ffmpeg_swscale PROPERTIES IMPORTED_LOCATION "${FFMPEG_SWSCALE}")
+
+add_library(panasonic_usb SHARED native_usb.cpp video_decoder.cpp)
 target_compile_features(panasonic_usb PRIVATE cxx_std_17)
 target_compile_options(panasonic_usb PRIVATE -Wall -Wextra -Werror=return-type)
-target_link_libraries(panasonic_usb PRIVATE libusb::usb-1.0 log)
+target_include_directories(panasonic_usb PRIVATE "${FFMPEG_INCLUDE_DIR}")
+target_link_libraries(panasonic_usb PRIVATE
+    libusb::usb-1.0
+    ffmpeg_avcodec
+    ffmpeg_avutil
+    ffmpeg_swscale
+    android
+    log
+)

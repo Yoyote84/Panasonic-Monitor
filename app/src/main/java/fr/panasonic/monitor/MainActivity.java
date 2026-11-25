@@ -18,6 +18,9 @@ import android.hardware.usb.UsbManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.view.Gravity;
+import android.view.Surface;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
 import android.view.View;
 import android.widget.Button;
 import android.widget.LinearLayout;
@@ -34,10 +37,9 @@ import java.util.Locale;
 import java.util.Map;
 
 /**
- * Step 2: explicit camera mode selection and native UVC transport probe.
- * Native code opens the Android-authorized USB file descriptor through libusb,
- * negotiates UVC PROBE/COMMIT, selects an isochronous alternate setting, and
- * samples packet traffic for five seconds. It does not decode or display frames.
+ * Step 3: camera mode selection, native UVC diagnostics and live video preview.
+ * The USB event thread copies UVC packets to a bounded native queue; FFmpeg
+ * assembles and decodes frames on a worker before rendering them to a Surface.
  */
 public class MainActivity extends Activity {
     private static final int REQUEST_CAMERA_PERMISSION = 41;
@@ -61,6 +63,11 @@ public class MainActivity extends Activity {
     private TextView selectedModeView;
     private TextView reportView;
     private Button nativeTestButton;
+    private Button previewStartButton;
+    private Button previewStopButton;
+    private SurfaceView previewSurfaceView;
+    private volatile boolean previewSurfaceReady;
+    private volatile boolean previewRunning;
     private RadioButton webcamRadio;
     private RadioButton dvRadio;
     private final StringBuilder report = new StringBuilder();
@@ -99,11 +106,15 @@ public class MainActivity extends Activity {
             renderReport();
             refreshStatus();
             updateNativeButton();
+            updatePreviewButtons();
             requestNextUsbPermission();
         }
     };
 
     private native String nativeProbeAndSample(int usbFileDescriptor, int mode, int durationMs);
+    private native String nativeStartPreview(int usbFileDescriptor, int mode, Surface surface);
+    private native void nativePreparePreview();
+    private native void nativeStopPreview();
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -124,6 +135,7 @@ public class MainActivity extends Activity {
             refreshStatus();
         }
         updateNativeButton();
+        updatePreviewButtons();
     }
 
     private void buildUi() {
@@ -142,7 +154,7 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.MATCH_PARENT, dp(42)));
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("ÉTAPE 2 · CHOIX DU MODE ET TRANSPORT USB NATIF");
+        subtitle.setText("ÉTAPE 3 · DÉCODAGE ET APERÇU VIDÉO EN DIRECT");
         subtitle.setTextColor(0xFF7DB6D8);
         subtitle.setTextSize(13);
         subtitle.setPadding(0, dp(2), 0, dp(12));
@@ -175,6 +187,12 @@ public class MainActivity extends Activity {
         modeGroup.check(selectedMode == PanasonicMode.WEBCAM
                 ? webcamRadio.getId() : dvRadio.getId());
         modeGroup.setOnCheckedChangeListener((group, checkedId) -> {
+            if (previewRunning) {
+                Toast.makeText(this, "Arrête l'aperçu avant de changer de moteur.", Toast.LENGTH_SHORT).show();
+                modeGroup.check(selectedMode == PanasonicMode.WEBCAM
+                        ? webcamRadio.getId() : dvRadio.getId());
+                return;
+            }
             selectedMode = checkedId == webcamRadio.getId()
                     ? PanasonicMode.WEBCAM : PanasonicMode.MOTION_DV;
             getSharedPreferences(PREFS, MODE_PRIVATE).edit()
@@ -183,6 +201,7 @@ public class MainActivity extends Activity {
                     + " — format requis : " + selectedMode.descriptorName());
             refreshStatus();
             updateNativeButton();
+            updatePreviewButtons();
         });
         root.addView(modeGroup);
 
@@ -199,6 +218,49 @@ public class MainActivity extends Activity {
         statusView.setTextSize(13);
         statusView.setPadding(0, 0, 0, dp(10));
         root.addView(statusView);
+
+        TextView previewLabel = new TextView(this);
+        previewLabel.setText("APERÇU CAMÉSCOPE");
+        previewLabel.setTextColor(0xFF7DB6D8);
+        previewLabel.setTextSize(13);
+        previewLabel.setPadding(0, dp(4), 0, dp(6));
+        root.addView(previewLabel);
+
+        previewSurfaceView = new SurfaceView(this);
+        previewSurfaceView.setBackgroundColor(0xFF000000);
+        previewSurfaceView.getHolder().addCallback(new SurfaceHolder.Callback() {
+            @Override
+            public void surfaceCreated(SurfaceHolder holder) {
+                previewSurfaceReady = true;
+                updatePreviewButtons();
+            }
+
+            @Override
+            public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+                previewSurfaceReady = holder.getSurface() != null
+                        && holder.getSurface().isValid();
+                updatePreviewButtons();
+            }
+
+            @Override
+            public void surfaceDestroyed(SurfaceHolder holder) {
+                previewSurfaceReady = false;
+                stopLivePreview();
+                updatePreviewButtons();
+            }
+        });
+        root.addView(previewSurfaceView, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(220)));
+
+        previewStartButton = new Button(this);
+        previewStartButton.setText("DÉMARRER L'APERÇU EN DIRECT");
+        previewStartButton.setOnClickListener(v -> startLivePreview());
+        root.addView(previewStartButton, fullWidthButton());
+
+        previewStopButton = new Button(this);
+        previewStopButton.setText("ARRÊTER L'APERÇU");
+        previewStopButton.setOnClickListener(v -> stopLivePreview());
+        root.addView(previewStopButton, fullWidthButton());
 
         Button scanButton = new Button(this);
         scanButton.setText("DÉTECTER ET ANALYSER LE MODE USB");
@@ -225,7 +287,7 @@ public class MainActivity extends Activity {
         root.addView(clearButton, fullWidthButton());
 
         TextView note = new TextView(this);
-        note.setText("Le test natif ouvre le périphérique autorisé avec libusb, négocie les paramètres UVC et compte les paquets isochrones. Il ne décode pas encore l'image et ne crée aucun fichier vidéo.");
+        note.setText("Le moteur interne prépare automatiquement les vrais paquets USB (en-têtes UVC, reconstruction des images et décodage FFmpeg) avant l'affichage. Aucun mode simulateur ni aucune image de remplacement. L'audio et sa synchronisation seront ajoutés après validation de l'image en direct.");
         note.setTextColor(0xFF9AA8B7);
         note.setTextSize(12);
         note.setPadding(0, dp(8), 0, dp(10));
@@ -241,9 +303,14 @@ public class MainActivity extends Activity {
         scroll.setFillViewport(true);
         scroll.addView(reportView);
         root.addView(scroll, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(180)));
 
-        setContentView(root);
+        // The preview surface and all controls stay reachable on the Z Flip's
+        // portrait layout; the whole page scrolls instead of clipping buttons.
+        ScrollView pageScroll = new ScrollView(this);
+        pageScroll.setFillViewport(true);
+        pageScroll.addView(root);
+        setContentView(pageScroll);
     }
 
     private LinearLayout.LayoutParams fullWidthButton() {
@@ -312,6 +379,10 @@ public class MainActivity extends Activity {
     }
 
     private void scanConnectedDevices() {
+        if (previewRunning) {
+            Toast.makeText(this, "Arrête l'aperçu avant de relancer la détection USB.", Toast.LENGTH_SHORT).show();
+            return;
+        }
         report.setLength(0);
         permissionQueue.clear();
         waitingForUsbPermission = false;
@@ -321,7 +392,7 @@ public class MainActivity extends Activity {
 
         String timestamp = new SimpleDateFormat(
                 "yyyy-MM-dd HH:mm:ss Z", Locale.FRANCE).format(new Date());
-        append("PANASONIC MONITOR — RAPPORT ÉTAPE 2\n");
+        append("PANASONIC MONITOR — RAPPORT ÉTAPE 3\n");
         append("Date du test : " + timestamp + "\n");
         append("Téléphone : " + Build.MANUFACTURER + " " + Build.MODEL
                 + " · Android " + Build.VERSION.RELEASE
@@ -338,6 +409,7 @@ public class MainActivity extends Activity {
             renderReport();
             refreshStatus();
             updateNativeButton();
+            updatePreviewButtons();
             return;
         }
 
@@ -365,6 +437,7 @@ public class MainActivity extends Activity {
         renderReport();
         refreshStatus();
         updateNativeButton();
+            updatePreviewButtons();
         requestNextUsbPermission();
     }
 
@@ -447,6 +520,7 @@ public class MainActivity extends Activity {
         if (waitingForUsbPermission || pendingCameraDevice != null || permissionQueue.isEmpty()) {
             renderReport();
             updateNativeButton();
+            updatePreviewButtons();
             return;
         }
 
@@ -474,6 +548,7 @@ public class MainActivity extends Activity {
             appendModeCompatibility(device);
             renderReport();
             updateNativeButton();
+            updatePreviewButtons();
             return;
         }
 
@@ -542,12 +617,13 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "Autorisation USB manquante. Relance la détection.", Toast.LENGTH_LONG).show();
             return;
         }
-        if (testRunning) {
+        if (testRunning || previewRunning) {
             return;
         }
 
         testRunning = true;
         updateNativeButton();
+            updatePreviewButtons();
         append("\n--- TEST NATIF UVC / ISOCHRONE ---\n");
         append("Mode : " + selectedMode.label + " · échantillonnage demandé : 5 secondes\n");
         if (selectedMode == PanasonicMode.MOTION_DV) {
@@ -590,6 +666,7 @@ public class MainActivity extends Activity {
                 testRunning = false;
                 renderReport();
                 updateNativeButton();
+                updatePreviewButtons();
             });
         }, "Panasonic-UVC-Probe").start();
     }
@@ -602,7 +679,8 @@ public class MainActivity extends Activity {
                 && selectedDevice != null
                 && isSelectedFormatAvailable()
                 && usbManager.hasPermission(selectedDevice)
-                && !testRunning;
+                && !testRunning
+                && !previewRunning;
         nativeTestButton.setEnabled(ready);
         if (!nativeAvailable) {
             nativeTestButton.setText("TRANSPORT NATIF INDISPONIBLE DANS CETTE APK");
@@ -614,6 +692,107 @@ public class MainActivity extends Activity {
             nativeTestButton.setText("DÉTECTER LE CAMÉSCOPE AVANT LE TEST NATIF");
         } else {
             nativeTestButton.setText("TESTER LE TRANSPORT NATIF (5 SECONDES)");
+        }
+    }
+
+    private void startLivePreview() {
+        if (!nativeAvailable) {
+            Toast.makeText(this, "Décodeur natif indisponible dans cette APK.", Toast.LENGTH_LONG).show();
+            return;
+        }
+        if (previewRunning || testRunning) return;
+        if (!previewSurfaceReady || previewSurfaceView == null
+                || previewSurfaceView.getHolder().getSurface() == null
+                || !previewSurfaceView.getHolder().getSurface().isValid()) {
+            Toast.makeText(this, "Surface d'aperçu non prête. Réessaie dans un instant.", Toast.LENGTH_LONG).show();
+            return;
+        }
+        if (selectedDevice == null || !isSelectedFormatAvailable()) {
+            Toast.makeText(this, "Détecte le caméscope et vérifie le format UVC demandé.", Toast.LENGTH_LONG).show();
+            return;
+        }
+        if (!usbManager.hasPermission(selectedDevice)) {
+            Toast.makeText(this, "Autorisation USB manquante. Relance la détection.", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        final UsbDevice device = selectedDevice;
+        final int nativeMode = selectedMode.nativeValue;
+        final Surface surface = previewSurfaceView.getHolder().getSurface();
+        previewRunning = true;
+        nativePreparePreview();
+        append("\n--- APERÇU VIDÉO EN DIRECT ---\n");
+        append("Moteur : " + selectedMode.label + " · arrêt manuel.\n");
+        if (selectedMode == PanasonicMode.MOTION_DV) {
+            append("Mode VCR/lecture avec cassette en lecture requis. La taille exacte de trame (PAL/NTSC) est prise dans la négociation UVC.\n");
+        } else {
+            append("Mode Webcam : le moteur interne reconstruit les images MJPEG annoncées par les descripteurs UVC.\n");
+        }
+        renderReport();
+        updateNativeButton();
+        updatePreviewButtons();
+
+        new Thread(() -> {
+            String result;
+            UsbDeviceConnection connection = null;
+            try {
+                connection = usbManager.openDevice(device);
+                if (connection == null) {
+                    result = "UsbManager.openDevice() a retourné null. Vérifie l'autorisation USB Android.";
+                } else {
+                    int fd = connection.getFileDescriptor();
+                    if (fd < 0) {
+                        result = "Descripteur USB Android invalide : " + fd;
+                    } else {
+                        result = nativeStartPreview(fd, nativeMode, surface);
+                    }
+                }
+            } catch (Throwable error) {
+                result = "Exception pendant l'aperçu : " + error.getClass().getSimpleName()
+                        + " — " + safeMessage(error);
+            } finally {
+                if (connection != null) connection.close();
+            }
+
+            final String finalResult = result;
+            runOnUiThread(() -> {
+                append(finalResult + "\n");
+                previewRunning = false;
+                renderReport();
+                updateNativeButton();
+                updatePreviewButtons();
+            });
+        }, "Panasonic-UVC-LivePreview").start();
+    }
+
+    private void stopLivePreview() {
+        if (!previewRunning) return;
+        if (nativeAvailable) nativeStopPreview();
+        append("\nArrêt de l'aperçu demandé ; les transferts en cours seront annulés avant la libération de l'interface.\n");
+        renderReport();
+        updatePreviewButtons();
+    }
+
+    private void updatePreviewButtons() {
+        if (previewStartButton == null || previewStopButton == null) return;
+        boolean canStart = nativeAvailable
+                && previewSurfaceReady
+                && selectedDevice != null
+                && isSelectedFormatAvailable()
+                && usbManager != null
+                && usbManager.hasPermission(selectedDevice)
+                && !previewRunning
+                && !testRunning;
+        previewStartButton.setEnabled(canStart);
+        previewStopButton.setEnabled(previewRunning);
+        if (previewRunning) {
+            previewStartButton.setText("APERÇU EN COURS…");
+        } else if (!previewSurfaceReady) {
+            previewStartButton.setText("SURFACE VIDÉO EN ATTENTE…");
+        } else if (selectedDevice == null) {
+            previewStartButton.setText("DÉTECTER LE CAMÉSCOPE AVANT L'APERÇU");
+        } else {
+            previewStartButton.setText("DÉMARRER L'APERÇU EN DIRECT");
         }
     }
 
@@ -682,7 +861,14 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    protected void onPause() {
+        stopLivePreview();
+        super.onPause();
+    }
+
+    @Override
     protected void onDestroy() {
+        stopLivePreview();
         super.onDestroy();
         try {
             unregisterReceiver(usbPermissionReceiver);
