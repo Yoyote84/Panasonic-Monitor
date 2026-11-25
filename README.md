@@ -49,6 +49,16 @@ La version 0.2.1 ajoute ou corrige :
 
 **Conclusion : l'étape 2 est avancée et le transport DV est validé, mais elle n'est pas encore déclarée complète.** Il manque la confirmation du nettoyage après le correctif et un échantillon positif du moteur Webcam MJPEG.
 
+### Rapport Webcam matériel — 25 novembre 2026, 14:48
+
+- Descripteurs : MJPEG annoncé, endpoint isochrone IN 0x81 présent, alt-setting 1.
+- Autorisation USB Android : accordée.
+- Pilote noyau VideoStreaming : déclaré inactif.
+- Réservation : `USBDEVFS_CLAIMINTERFACE errno=16 (EBUSY)`, puis `libusb_claim_interface=-6 (LIBUSB_ERROR_BUSY)`.
+- PROBE/COMMIT et transfert isochrone : non atteints.
+
+**Diagnostic :** l'échec intervient à la réservation de l'interface VideoStreaming, pas dans la sélection MJPEG. EBUSY alors que le pilote noyau est déclaré inactif suggère une interface déjà revendiquée via un autre handle/processus ou un état usbfs résiduel. Le propriétaire ne peut pas être identifié par ce rapport. Ne pas forcer un reset global du périphérique, car cela pourrait interrompre les interfaces audio ou un autre propriétaire.
+
 ### Test sur le Galaxy Z Flip 6
 
 1. Installe l'APK debug de cette étape.
