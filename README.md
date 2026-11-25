@@ -88,8 +88,13 @@ Cette branche ouvre le travail de l'étape 3 sans déclarer l'étape 2 terminée
 
 - Le transport libusb conserve les transferts isochrones et transmet chaque paquet UVC avec son en-tête au décodeur.
 - Le callback USB ne décode pas : il copie les données dans un tampon circulaire SPSC borné de 8 Mio. En cas de saturation, les pertes sont comptées et l'assembleur est resynchronisé.
-- Le moteur DV conserve les bits `FID` et `EOF` de chaque en-tête UVC. Le bit `FID` (frontière obligatoire pour DV) déclenche la fin de la trame précédente ; le bit `EOF`, lorsqu'il est fourni, permet de la terminer plus tôt. Une trame n'est envoyée à FFmpeg que si sa taille correspond exactement au format négocié : 144 000 octets en PAL ou 120 000 octets en NTSC. Les trames incomplètes ou trop longues sont rejetées.
-- Le moteur MJPEG assemble les payloads à l'aide des bits UVC FID et EOF.
+- Un moteur interne de compatibilité prépare automatiquement le flux réel : vérification de l'en-tête UVC (y compris les champs PTS/SCR optionnels), conservation des indicateurs FID/EOF, reconstruction des trames puis transmission à FFmpeg. Il ne génère aucune image de remplacement et n'ajoute aucun mode simulateur.
+- L'assembleur commun traite `EOF` comme frontière prioritaire et utilise le changement de `FID` comme repli si EOF manque. Après un EOF, les payloads portant encore le même FID sont ignorés jusqu'au FID suivant, afin d'éviter de créer une seconde trame avec des fragments résiduels.
+- Les paquets UVC contenant uniquement leur en-tête sont conservés : ils peuvent porter un EOF/FID utile même sans octets vidéo.
+- Pour DV, une trame n'est envoyée à FFmpeg que si sa taille correspond exactement à la taille négociée par PROBE (DV25 classique : 144 000 octets PAL ou 120 000 NTSC). Les trames incomplètes ou trop longues sont rejetées avant FFmpeg.
+- Les images MJPEG sont assemblées par le même mécanisme FID/EOF, avec une limite mémoire stricte de 8 Mio et une dernière vérification EOI si le flux s'arrête sans signal EOF.
+- En cas de saturation du tampon, le moteur efface aussi tout enregistrement partiel du parseur et attend le prochain changement FID avant de reprendre, sans assembler des données provenant d'avant et d'après la perte.
+- À l'arrêt, le dernier paquet DV n'est transmis que si sa taille exacte est atteinte ; une trame MJPEG sans EOF n'est acceptée que si son marqueur JPEG EOI est présent.
 - FFmpeg 9.1 décode DV/MJPEG ; libswscale convertit les images en RGBA et une Surface Android les affiche.
 - L'arrêt annule les transferts isochrones, attend leurs callbacks, vide le tampon restant et ferme l'interface avant de libérer le descripteur USB.
 - Les paquets marqués UVC ERR sont conservés : ces bits peuvent être présents sur des payloads DV exploitables pendant la synchronisation de lecture.
@@ -117,7 +122,7 @@ La compilation utilise les bibliothèques partagées LGPL et n'active ni les com
 5. Refaire l'essai après débranchement/rebranchement.
 6. Répéter en Webcam MJPEG après résolution du conflit `EBUSY`.
 
-**Limite actuelle :** cette première livraison de l'étape 3 traite l'image uniquement. Le flux audio USB, l'horodatage commun et la synchronisation audio/vidéo ne sont pas encore implémentés ni validés. Aucun enregistrement vidéo ou MP4 n'est produit à ce stade. L'étape 3 reste donc en cours jusqu'au décodage vérifié sur le caméscope et à la synchronisation A/V.
+**Validation restante :** les tests natifs automatisés couvrent désormais les frontières EOF/FID, les paquets d'en-tête seuls, les trames tronquées/surdimensionnées, la resynchronisation après perte de tampon et la dernière trame à l'arrêt. La CI doit valider cette révision. Le décodage et l'affichage réels doivent toujours être vérifiés sur le NV-GS140 + Galaxy Z Flip 6. Le flux audio USB et la synchronisation A/V ne sont pas encore implémentés ; aucun enregistrement DV/MP4 n'est encore produit. L'étape 3 reste donc en cours.
 
 ## Compilation
 
@@ -142,6 +147,6 @@ APK : `app/build/outputs/apk/debug/app-debug.apk`
 
 1. Diagnostic USB et identification des formats annoncés par le NV-GS140 — réalisé avec les rapports de test.
 2. Transport natif UVC-DV / Webcam et échantillonnage isochrone — transport DV validé sur matériel ; correction du nettoyage libusb poussée ; validation Webcam MJPEG et nouveau test de libération/reconnexion encore requis.
-3. Décodage, aperçu en direct et synchronisation audio/vidéo.
+3. Décodage et aperçu en direct — moteur interne de préparation UVC/DV, assembleur FID/EOF corrigé, tests de régression natifs ajoutés ; validation vidéo matérielle et audio/A-V encore requises.
 4. Enregistrement DV original, MP4 et bibliothèque de médias.
 5. Stabilité, reconnexion, optimisation, tests finaux et APK final.
