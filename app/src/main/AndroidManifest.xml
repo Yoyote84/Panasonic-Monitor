@@ -5,8 +5,6 @@
         android:name="android.hardware.usb.host"
         android:required="true" />
 
-    <!-- Android may require CAMERA before granting USB access to a USB Video Class device.
-         Panasonic Monitor does not open or record from the phone camera. -->
     <uses-permission android:name="android.permission.CAMERA" />
 
     <application

@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - step-1-usb-diagnostics
+      - step-2-native-transport
   pull_request:
     branches:
       - main
@@ -15,7 +16,7 @@ permissions:
 
 jobs:
   build:
-    name: Build and test diagnostic APK
+    name: Build and test Android app and native UVC transport
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -32,21 +33,21 @@ jobs:
         with:
           packages: 'platform-tools'
 
-      - name: Install Android SDK components
-        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - name: Install Android SDK, NDK and CMake
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
 
       - name: Set up Gradle 8.13
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.13'
 
-      - name: Run unit tests and build APK
+      - name: Run unit tests and build arm64 APK
         run: gradle --no-daemon :app:testDebugUnitTest :app:assembleDebug
 
       - name: Upload diagnostic APK
         uses: actions/upload-artifact@v4
         with:
-          name: Panasonic-Monitor-debug
+          name: Panasonic-Monitor-step2-arm64-debug
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30

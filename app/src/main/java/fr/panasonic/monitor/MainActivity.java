@@ -7,6 +7,7 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.hardware.usb.UsbConstants;
 import android.hardware.usb.UsbDevice;
@@ -20,6 +21,8 @@ import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
 import android.widget.LinearLayout;
+import android.widget.RadioButton;
+import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -31,21 +34,43 @@ import java.util.Locale;
 import java.util.Map;
 
 /**
- * Step 1: enumerate USB devices, request Android permissions, and inspect descriptors.
- * No video endpoint is opened and no video frames are captured in this diagnostic build.
+ * Step 2: explicit camera mode selection and native UVC transport probe.
+ * Native code opens the Android-authorized USB file descriptor through libusb,
+ * negotiates UVC PROBE/COMMIT, selects an isochronous alternate setting, and
+ * samples packet traffic for five seconds. It does not decode or display frames.
  */
 public class MainActivity extends Activity {
     private static final int REQUEST_CAMERA_PERMISSION = 41;
     private static final int USB_CLASS_VIDEO = 0x0E;
+    private static final int PANASONIC_VENDOR_ID = 0x04DA;
+    private static final String PREFS = "panasonic_monitor";
+    private static final String PREF_MODE = "selected_mode";
+
+    private static boolean nativeAvailable;
+    static {
+        try {
+            System.loadLibrary("panasonic_usb");
+            nativeAvailable = true;
+        } catch (UnsatisfiedLinkError error) {
+            nativeAvailable = false;
+        }
+    }
 
     private UsbManager usbManager;
     private TextView statusView;
+    private TextView selectedModeView;
     private TextView reportView;
+    private Button nativeTestButton;
+    private RadioButton webcamRadio;
+    private RadioButton dvRadio;
     private final StringBuilder report = new StringBuilder();
     private final ArrayList<UsbDevice> permissionQueue = new ArrayList<>();
     private UsbDevice pendingCameraDevice;
+    private UsbDevice selectedDevice;
     private boolean waitingForUsbPermission;
+    private boolean testRunning;
     private String permissionAction;
+    private PanasonicMode selectedMode = PanasonicMode.MOTION_DV;
 
     private final BroadcastReceiver usbPermissionReceiver = new BroadcastReceiver() {
         @Override
@@ -63,21 +88,33 @@ public class MainActivity extends Activity {
                 append("Réponse d'autorisation USB reçue sans appareil associé.\n");
             } else if (granted) {
                 append("\nAutorisation USB accordée : " + deviceLabel(device) + "\n");
+                if (matchesSelectedMode(device)) {
+                    selectedDevice = device;
+                }
                 inspectRawDescriptors(device);
             } else {
                 append("\nAutorisation USB refusée : " + deviceLabel(device) + "\n");
             }
 
             renderReport();
+            refreshStatus();
+            updateNativeButton();
             requestNextUsbPermission();
         }
     };
+
+    private native String nativeProbeAndSample(int usbFileDescriptor, int mode, int durationMs);
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         usbManager = (UsbManager) getSystemService(Context.USB_SERVICE);
         permissionAction = getPackageName() + ".USB_PERMISSION";
+
+        SharedPreferences preferences = getSharedPreferences(PREFS, MODE_PRIVATE);
+        selectedMode = PanasonicMode.valueOf(preferences.getString(
+                PREF_MODE, PanasonicMode.MOTION_DV.name()));
+
         buildUi();
         registerUsbPermissionReceiver();
 
@@ -86,6 +123,7 @@ public class MainActivity extends Activity {
         } else {
             refreshStatus();
         }
+        updateNativeButton();
     }
 
     private void buildUi() {
@@ -104,29 +142,74 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.MATCH_PARENT, dp(42)));
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("ÉTAPE 1 · DIAGNOSTIC USB");
+        subtitle.setText("ÉTAPE 2 · CHOIX DU MODE ET TRANSPORT USB NATIF");
         subtitle.setTextColor(0xFF7DB6D8);
         subtitle.setTextSize(13);
-        subtitle.setPadding(0, dp(2), 0, dp(14));
+        subtitle.setPadding(0, dp(2), 0, dp(12));
         root.addView(subtitle);
 
         TextView explanation = new TextView(this);
-        explanation.setText("Branche le NV-GS140 au téléphone avec un adaptateur USB-C OTG et un câble de données. Allume le caméscope, choisis son mode USB, puis lance l'analyse. Le test lit les descripteurs, pas la vidéo.");
+        explanation.setText("Choisis le même mode que celui réglé dans le menu USB du NV-GS140. L'application ne change pas le mode du caméscope : elle sélectionne le moteur correspondant.");
         explanation.setTextColor(0xFFD3DCE5);
         explanation.setTextSize(14);
-        explanation.setPadding(0, 0, 0, dp(12));
+        explanation.setPadding(0, 0, 0, dp(10));
         root.addView(explanation);
+
+        RadioGroup modeGroup = new RadioGroup(this);
+        modeGroup.setOrientation(LinearLayout.VERTICAL);
+
+        webcamRadio = new RadioButton(this);
+        webcamRadio.setId(View.generateViewId());
+        webcamRadio.setText("WEBCAM  ·  04DA:231A");
+        webcamRadio.setTextColor(0xFFE7EDF3);
+        webcamRadio.setTextSize(15);
+        modeGroup.addView(webcamRadio);
+
+        dvRadio = new RadioButton(this);
+        dvRadio.setId(View.generateViewId());
+        dvRadio.setText("MONITOR DV / MOTION DV  ·  04DA:2318");
+        dvRadio.setTextColor(0xFFE7EDF3);
+        dvRadio.setTextSize(15);
+        modeGroup.addView(dvRadio);
+
+        modeGroup.check(selectedMode == PanasonicMode.WEBCAM
+                ? webcamRadio.getId() : dvRadio.getId());
+        modeGroup.setOnCheckedChangeListener((group, checkedId) -> {
+            selectedMode = checkedId == webcamRadio.getId()
+                    ? PanasonicMode.WEBCAM : PanasonicMode.MOTION_DV;
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                    .putString(PREF_MODE, selectedMode.name()).apply();
+            selectedDevice = null;
+            selectedModeView.setText("Mode choisi : " + selectedMode.label
+                    + " — " + selectedMode.description);
+            statusView.setText("Mode modifié. Relance la détection USB.");
+            updateNativeButton();
+        });
+        root.addView(modeGroup);
+
+        selectedModeView = new TextView(this);
+        selectedModeView.setTextColor(0xFFFFD18A);
+        selectedModeView.setTextSize(13);
+        selectedModeView.setPadding(0, dp(4), 0, dp(10));
+        selectedModeView.setText("Mode choisi : " + selectedMode.label
+                + " — " + selectedMode.description);
+        root.addView(selectedModeView);
 
         statusView = new TextView(this);
         statusView.setTextColor(0xFFFFD18A);
         statusView.setTextSize(13);
-        statusView.setPadding(0, 0, 0, dp(12));
+        statusView.setPadding(0, 0, 0, dp(10));
         root.addView(statusView);
 
         Button scanButton = new Button(this);
-        scanButton.setText("ANALYSER LES APPAREILS USB");
+        scanButton.setText("DÉTECTER ET ANALYSER LE MODE USB");
         scanButton.setOnClickListener(v -> scanConnectedDevices());
         root.addView(scanButton, fullWidthButton());
+
+        nativeTestButton = new Button(this);
+        nativeTestButton.setText("TESTER LE TRANSPORT NATIF (5 SECONDES)");
+        nativeTestButton.setOnClickListener(v -> startNativeTransportTest());
+        root.addView(nativeTestButton, fullWidthButton());
 
         Button shareButton = new Button(this);
         shareButton.setText("PARTAGER / EXPORTER LE RAPPORT");
@@ -137,16 +220,16 @@ public class MainActivity extends Activity {
         clearButton.setText("EFFACER LE RAPPORT");
         clearButton.setOnClickListener(v -> {
             report.setLength(0);
-            append("Rapport effacé. Branche le caméscope puis relance l'analyse.\n");
+            append("Rapport effacé. Choisis le mode, branche le caméscope et relance la détection.\n");
             renderReport();
         });
         root.addView(clearButton, fullWidthButton());
 
         TextView note = new TextView(this);
-        note.setText("Note Android : une autorisation « Caméra » peut être demandée pour accéder à un périphérique USB vidéo. Panasonic Monitor n'utilise pas la caméra du téléphone.");
+        note.setText("Le test natif ouvre le périphérique autorisé avec libusb, négocie les paramètres UVC et compte les paquets isochrones. Il ne décode pas encore l'image et ne crée aucun fichier vidéo.");
         note.setTextColor(0xFF9AA8B7);
         note.setTextSize(12);
-        note.setPadding(0, dp(10), 0, dp(12));
+        note.setPadding(0, dp(8), 0, dp(10));
         root.addView(note);
 
         reportView = new TextView(this);
@@ -187,7 +270,12 @@ public class MainActivity extends Activity {
     private void refreshStatus() {
         Map<String, UsbDevice> devices = usbManager.getDeviceList();
         statusView.setText("USB Host prêt · " + devices.size()
-                + " appareil(s) USB actuellement détecté(s).");
+                + " appareil(s) USB détecté(s). Mode demandé : " + selectedMode.label);
+    }
+
+    private boolean matchesSelectedMode(UsbDevice device) {
+        return device.getVendorId() == PANASONIC_VENDOR_ID
+                && device.getProductId() == selectedMode.productId;
     }
 
     private void scanConnectedDevices() {
@@ -195,40 +283,64 @@ public class MainActivity extends Activity {
         permissionQueue.clear();
         waitingForUsbPermission = false;
         pendingCameraDevice = null;
+        selectedDevice = null;
 
         String timestamp = new SimpleDateFormat(
                 "yyyy-MM-dd HH:mm:ss Z", Locale.FRANCE).format(new Date());
-        append("PANASONIC MONITOR — RAPPORT DE DIAGNOSTIC USB\n");
+        append("PANASONIC MONITOR — RAPPORT ÉTAPE 2\n");
         append("Date du test : " + timestamp + "\n");
         append("Téléphone : " + Build.MANUFACTURER + " " + Build.MODEL
                 + " · Android " + Build.VERSION.RELEASE
                 + " (API " + Build.VERSION.SDK_INT + ")\n");
-        append("USB Host : "
-                + getPackageManager().hasSystemFeature(PackageManager.FEATURE_USB_HOST)
-                + "\n\n");
+        append("Mode sélectionné : " + selectedMode.label + "\n");
+        append(String.format(Locale.US, "VID:PID attendu : %04X:%04X\n\n",
+                PANASONIC_VENDOR_ID, selectedMode.productId));
 
         Map<String, UsbDevice> devices = usbManager.getDeviceList();
         append("Appareils détectés : " + devices.size() + "\n");
 
         if (devices.isEmpty()) {
-            append("Aucun périphérique visible. Vérifie le câble de données, l'adaptateur OTG, l'alimentation du caméscope et son mode USB.\n");
+            append("Aucun périphérique USB visible. Vérifie OTG, câble de données, alimentation et mode USB du caméscope.\n");
             renderReport();
             refreshStatus();
+            updateNativeButton();
             return;
         }
 
         for (UsbDevice device : devices.values()) {
             append("\n==================================================\n");
             append(describeDevice(device));
-            if (usbManager.hasPermission(device)) {
-                inspectRawDescriptors(device);
-            } else {
-                permissionQueue.add(device);
+
+            if (device.getVendorId() == PANASONIC_VENDOR_ID) {
+                PanasonicMode detected = PanasonicMode.fromProductId(device.getProductId());
+                if (detected != null) {
+                    append("Mode Panasonic détecté : " + detected.label + "\n");
+                    if (detected == selectedMode) {
+                        selectedDevice = device;
+                        if (usbManager.hasPermission(device)) {
+                            append("Autorisation USB déjà accordée.\n");
+                            inspectRawDescriptors(device);
+                        } else {
+                            permissionQueue.add(device);
+                        }
+                    } else {
+                        append("ATTENTION : ce n'est pas le mode sélectionné. Choisis "
+                                + detected.label + " dans l'application ou change le mode USB du caméscope, puis rebranche-le.\n");
+                    }
+                } else {
+                    append("Périphérique Panasonic détecté, mais identifiant produit non reconnu.\n");
+                }
             }
+        }
+
+        if (selectedDevice == null && permissionQueue.isEmpty()) {
+            append("\nAucun périphérique correspondant au mode sélectionné ("
+                    + selectedMode.label + ").\n");
         }
 
         renderReport();
         refreshStatus();
+        updateNativeButton();
         requestNextUsbPermission();
     }
 
@@ -285,17 +397,14 @@ public class MainActivity extends Activity {
             UsbDescriptorParser.ParseResult parsed = UsbDescriptorParser.parse(raw);
             append(parsed.toReport());
 
-            append("\n--- INTERPRÉTATION PRUDENTE ---\n");
             if (parsed.hasDvFormat) {
-                append("Le périphérique annonce un descripteur UVC de format DV. Cela ne prouve pas encore que le flux DV peut être ouvert ni décodé sur Android.\n");
-            } else {
-                append("Aucun VS_FORMAT_DV n'a été trouvé dans les descripteurs lus. Cela peut signifier que ce mode n'est pas exposé dans la configuration USB active, ou que le caméscope doit être placé dans un autre mode.\n");
+                append("\nLe périphérique annonce VS_FORMAT_DV.\n");
             }
             if (parsed.hasMjpegFormat) {
-                append("Le périphérique annonce aussi un descripteur UVC de format MJPEG.\n");
+                append("Le périphérique annonce VS_FORMAT_MJPEG.\n");
             }
             if (parsed.hasIsochronousVideoEndpoint) {
-                append("Un endpoint vidéo isochrone est décrit. L'API USB Java standard d'Android ne sait pas le transférer : un transport natif devra être étudié à l'étape 2.\n");
+                append("Endpoint vidéo isochrone détecté. Le transport natif libusb est utilisé pour le test de l'étape 2.\n");
             }
         } catch (SecurityException e) {
             append("Accès refusé par Android : " + safeMessage(e) + "\n");
@@ -311,6 +420,7 @@ public class MainActivity extends Activity {
     private void requestNextUsbPermission() {
         if (waitingForUsbPermission || pendingCameraDevice != null || permissionQueue.isEmpty()) {
             renderReport();
+            updateNativeButton();
             return;
         }
 
@@ -320,7 +430,7 @@ public class MainActivity extends Activity {
                 && checkSelfPermission(Manifest.permission.CAMERA)
                 != PackageManager.PERMISSION_GRANTED) {
             pendingCameraDevice = device;
-            append("\nAndroid exige l'autorisation « Caméra » pour accéder à ce périphérique USB vidéo. L'application n'ouvre pas la caméra du téléphone.\n");
+            append("\nAndroid demande l'autorisation « Caméra » pour l'accès USB vidéo. Panasonic Monitor n'ouvre pas la caméra du téléphone.\n");
             renderReport();
             requestPermissions(
                     new String[]{Manifest.permission.CAMERA},
@@ -333,9 +443,10 @@ public class MainActivity extends Activity {
 
     private void requestUsbPermission(UsbDevice device) {
         if (usbManager.hasPermission(device)) {
+            selectedDevice = device;
             inspectRawDescriptors(device);
             renderReport();
-            requestNextUsbPermission();
+            updateNativeButton();
             return;
         }
 
@@ -382,9 +493,96 @@ public class MainActivity extends Activity {
         if (granted && device != null) {
             requestUsbPermission(device);
         } else {
-            append("\nAutorisation « Caméra » refusée : Android ne permet donc pas à l'application de demander l'accès USB à ce périphérique vidéo.\n");
+            append("\nAutorisation « Caméra » refusée. Android ne permet pas à l'application de demander l'accès à ce périphérique vidéo.\n");
             renderReport();
             requestNextUsbPermission();
+        }
+    }
+
+    private void startNativeTransportTest() {
+        if (!nativeAvailable) {
+            append("\nBibliothèque native absente. Réinstalle une APK construite avec le workflow étape 2.\n");
+            renderReport();
+            return;
+        }
+        if (selectedDevice == null || !matchesSelectedMode(selectedDevice)) {
+            Toast.makeText(this, "Détecte d'abord le caméscope dans le mode sélectionné.", Toast.LENGTH_LONG).show();
+            return;
+        }
+        if (!usbManager.hasPermission(selectedDevice)) {
+            Toast.makeText(this, "Autorisation USB manquante. Relance la détection.", Toast.LENGTH_LONG).show();
+            return;
+        }
+        if (testRunning) {
+            return;
+        }
+
+        testRunning = true;
+        updateNativeButton();
+        append("\n--- TEST NATIF UVC / ISOCHRONE ---\n");
+        append("Mode : " + selectedMode.label + " · échantillonnage demandé : 5 secondes\n");
+        if (selectedMode == PanasonicMode.MOTION_DV) {
+            append("Conseil : place le caméscope en mode VCR/lecture avec une cassette en lecture pour vérifier la sortie DV.\n");
+        } else {
+            append("Mode Webcam : place le caméscope dans le mode caméra/webcam.\n");
+        }
+        renderReport();
+
+        final UsbDevice device = selectedDevice;
+        final int nativeMode = selectedMode == PanasonicMode.WEBCAM ? 0 : 1;
+
+        new Thread(() -> {
+            String result;
+            UsbDeviceConnection connection = null;
+            try {
+                connection = usbManager.openDevice(device);
+                if (connection == null) {
+                    result = "UsbManager.openDevice() a retourné null. Vérifie les permissions et les contrôles de confidentialité Android.";
+                } else {
+                    int fd = connection.getFileDescriptor();
+                    if (fd < 0) {
+                        result = "Descripteur de fichier USB invalide : " + fd;
+                    } else {
+                        result = nativeProbeAndSample(fd, nativeMode, 5000);
+                    }
+                }
+            } catch (Throwable error) {
+                result = "Exception pendant le test natif : " + error.getClass().getSimpleName()
+                        + " — " + safeMessage(error);
+            } finally {
+                if (connection != null) {
+                    connection.close();
+                }
+            }
+
+            final String finalResult = result;
+            runOnUiThread(() -> {
+                append(finalResult + "\n");
+                testRunning = false;
+                renderReport();
+                updateNativeButton();
+            });
+        }, "Panasonic-UVC-Probe").start();
+    }
+
+    private void updateNativeButton() {
+        if (nativeTestButton == null) {
+            return;
+        }
+        boolean ready = nativeAvailable
+                && selectedDevice != null
+                && matchesSelectedMode(selectedDevice)
+                && usbManager.hasPermission(selectedDevice)
+                && !testRunning;
+        nativeTestButton.setEnabled(ready);
+        if (!nativeAvailable) {
+            nativeTestButton.setText("TRANSPORT NATIF INDISPONIBLE DANS CETTE APK");
+        } else if (testRunning) {
+            nativeTestButton.setText("TEST NATIF EN COURS…");
+        } else if (!ready) {
+            nativeTestButton.setText("DÉTECTER LE CAMÉSCOPE AVANT LE TEST NATIF");
+        } else {
+            nativeTestButton.setText("TESTER LE TRANSPORT NATIF (5 SECONDES)");
         }
     }
 
@@ -427,9 +625,9 @@ public class MainActivity extends Activity {
         }
     }
 
-    private String safeMessage(Exception exception) {
-        String message = exception.getMessage();
-        return message == null ? exception.getClass().getSimpleName() : message;
+    private String safeMessage(Throwable error) {
+        String message = error.getMessage();
+        return message == null ? error.getClass().getSimpleName() : message;
     }
 
     private void append(String text) {
@@ -447,7 +645,7 @@ public class MainActivity extends Activity {
         }
         Intent send = new Intent(Intent.ACTION_SEND);
         send.setType("text/plain");
-        send.putExtra(Intent.EXTRA_SUBJECT, "Panasonic Monitor — diagnostic USB");
+        send.putExtra(Intent.EXTRA_SUBJECT, "Panasonic Monitor — rapport USB");
         send.putExtra(Intent.EXTRA_TEXT, report.toString());
         startActivity(Intent.createChooser(send, "Partager le rapport USB"));
     }
