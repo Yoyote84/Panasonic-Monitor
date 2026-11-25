@@ -36,6 +36,8 @@ La version 0.2.1 ajoute ou corrige :
 - vérification de l'index de format retourné par PROBE ;
 - sélection de l'alt-setting isochrone qui offre la plus petite capacité suffisante au payload UVC annoncé, avec avertissement si aucun alt-setting ne suffit ;
 - échantillonnage des transferts isochrones pendant cinq secondes avec comptage des paquets, octets et erreurs.
+- diagnostic de l'état d'un éventuel pilote noyau et détachement automatique ciblé de la seule interface VideoStreaming pendant sa réservation, avec restauration à la libération ; les interfaces VideoControl et audio ne sont pas détachées ;
+- dimensionnement adaptatif des URB isochrones sous un plafond prudent de 15 Kio par transfert pour éviter les limites USBFS/mémoire observées sur Android récent.
 
 **Cette étape ne décode pas encore l'image, n'affiche pas la vidéo et n'enregistre aucun fichier.** Elle vérifie que le téléphone peut ouvrir le périphérique, négocier le flux UVC et recevoir des données isochrones. Les transferts doivent encore être validés sur le NV-GS140 physique : une compilation réussie ne remplace pas le test matériel.
 
