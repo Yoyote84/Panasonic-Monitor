@@ -16,8 +16,6 @@
 namespace {
 
 constexpr uint16_t kPanasonicVid = 0x04DA;
-constexpr uint16_t kWebcamPid = 0x231A;
-constexpr uint16_t kMotionDvPid = 0x2318;
 
 constexpr uint8_t kUsbClassVideo = 0x0E;
 constexpr uint8_t kUsbSubclassVideoStreaming = 0x02;
@@ -85,11 +83,13 @@ struct UvcFormat {
     int interfaceNumber = -1;
 };
 
-bool parseUvcFormat(const libusb_interface_descriptor& alt,
-                    bool wantDv,
-                    UvcFormat& selected) {
-    const unsigned char* cursor = alt.extra;
-    int remaining = alt.extra_length;
+bool parseUvcExtra(const unsigned char* extra,
+                   int extraLength,
+                   int interfaceNumber,
+                   bool wantDv,
+                   UvcFormat& selected) {
+    const unsigned char* cursor = extra;
+    int remaining = extraLength;
 
     while (cursor != nullptr && remaining >= 2) {
         const int length = cursor[0];
@@ -104,7 +104,7 @@ bool parseUvcFormat(const libusb_interface_descriptor& alt,
                 selected.dv = true;
                 selected.formatIndex = cursor[3];
                 selected.frameIndex = 0;
-                selected.interfaceNumber = alt.bInterfaceNumber;
+                selected.interfaceNumber = interfaceNumber;
                 return true;
             }
 
@@ -113,15 +113,13 @@ bool parseUvcFormat(const libusb_interface_descriptor& alt,
                 selected.dv = false;
                 selected.formatIndex = cursor[3];
                 selected.frameIndex = cursor[6];
-                selected.interfaceNumber = alt.bInterfaceNumber;
+                selected.interfaceNumber = interfaceNumber;
                 if (selected.frameIndex == 0) {
                     selected.frameIndex = 1;
                 }
 
-                // Locate the matching default frame descriptor, if present, to
-                // preserve the camera's advertised frame interval in PROBE.
-                const unsigned char* frameCursor = alt.extra;
-                int frameRemaining = alt.extra_length;
+                const unsigned char* frameCursor = extra;
+                int frameRemaining = extraLength;
                 while (frameCursor != nullptr && frameRemaining >= 2) {
                     const int frameLength = frameCursor[0];
                     if (frameLength < 2 || frameLength > frameRemaining) {
@@ -147,10 +145,18 @@ bool parseUvcFormat(const libusb_interface_descriptor& alt,
     return false;
 }
 
+bool parseUvcFormat(const libusb_interface_descriptor& alt,
+                    bool wantDv,
+                    UvcFormat& selected) {
+    return parseUvcExtra(alt.extra, alt.extra_length,
+                         alt.bInterfaceNumber, wantDv, selected);
+}
+
 bool findModeFormat(libusb_config_descriptor* config,
                     bool wantDv,
                     UvcFormat& format,
                     std::ostringstream& report) {
+    std::vector<int> streamingInterfaces;
     for (uint8_t i = 0; i < config->bNumInterfaces; ++i) {
         const libusb_interface& interface = config->interface[i];
         for (int a = 0; a < interface.num_altsetting; ++a) {
@@ -158,6 +164,11 @@ bool findModeFormat(libusb_config_descriptor* config,
             if (alt.bInterfaceClass != kUsbClassVideo ||
                 alt.bInterfaceSubClass != kUsbSubclassVideoStreaming) {
                 continue;
+            }
+
+            if (std::find(streamingInterfaces.begin(), streamingInterfaces.end(),
+                          static_cast<int>(alt.bInterfaceNumber)) == streamingInterfaces.end()) {
+                streamingInterfaces.push_back(static_cast<int>(alt.bInterfaceNumber));
             }
             if (parseUvcFormat(alt, wantDv, format)) {
                 report << "Interface UVC VideoStreaming : "
@@ -172,6 +183,23 @@ bool findModeFormat(libusb_config_descriptor* config,
                 }
                 return true;
             }
+        }
+    }
+
+    // Some UVC host stacks attach class-specific descriptors to the
+    // configuration descriptor rather than the streaming interface extra.
+    // Associate them only when there is exactly one VideoStreaming interface.
+    if (config->extra != nullptr && config->extra_length > 0 &&
+        streamingInterfaces.size() == 1) {
+        report << "Recherche des descripteurs de format UVC au niveau configuration.\n";
+        if (parseUvcExtra(config->extra, config->extra_length,
+                          streamingInterfaces.front(), wantDv, format)) {
+            report << "Interface UVC VideoStreaming : " << format.interfaceNumber
+                   << " (association unique depuis la configuration)\n";
+            report << "Format " << (wantDv ? "DV" : "MJPEG")
+                   << " index : " << static_cast<int>(format.formatIndex)
+                   << " · frame index : " << static_cast<int>(format.frameIndex) << "\n";
+            return true;
         }
     }
     return false;
@@ -189,8 +217,8 @@ IsoEndpoint selectIsoEndpoint(libusb_config_descriptor* config,
                               int interfaceNumber,
                               uint32_t requestedPayload,
                               std::ostringstream& report) {
-    IsoEndpoint best;
-    uint32_t bestCapacity = 0;
+    IsoEndpoint bestAdequate;
+    IsoEndpoint largestFallback;
 
     for (uint8_t i = 0; i < config->bNumInterfaces; ++i) {
         const libusb_interface& interface = config->interface[i];
@@ -212,29 +240,49 @@ IsoEndpoint selectIsoEndpoint(libusb_config_descriptor* config,
 
                 const uint16_t raw = endpoint.wMaxPacketSize;
                 const uint32_t packet = raw & 0x07FF;
-                const uint32_t transactions = 1U + ((raw >> 11) & 0x03);
-                const uint32_t capacity = packet * transactions;
-                report << "Endpoint ISO candidat : 0x" << std::hex
+                const uint32_t extraTransactions = (raw >> 11) & 0x03;
+                // USB 2.0 reserves transaction code 3.
+                if (packet == 0 || extraTransactions == 3) {
+                    continue;
+                }
+                const uint32_t capacity = packet * (1U + extraTransactions);
+
+                report << "Endpoint ISO IN candidat : 0x" << std::hex
                        << static_cast<int>(endpoint.bEndpointAddress) << std::dec
                        << " · interface " << interfaceNumber
                        << " alt " << static_cast<int>(alt.bAlternateSetting)
-                       << " · capacité paquet " << capacity << " octets\n";
+                       << " · capacité par intervalle " << capacity << " octets"
+                       << " · bInterval=" << static_cast<int>(endpoint.bInterval) << "\n";
 
-                if (capacity > bestCapacity) {
-                    best.found = true;
-                    best.address = endpoint.bEndpointAddress;
-                    best.alternateSetting = alt.bAlternateSetting;
-                    best.rawPacketSize = raw;
-                    best.packetCapacity = capacity;
-                    bestCapacity = capacity;
-                }
-                if (capacity >= requestedPayload) {
-                    return best;
+                IsoEndpoint candidate;
+                candidate.found = true;
+                candidate.address = endpoint.bEndpointAddress;
+                candidate.alternateSetting = alt.bAlternateSetting;
+                candidate.rawPacketSize = raw;
+                candidate.packetCapacity = capacity;
+
+                if (requestedPayload > 0 && capacity >= requestedPayload) {
+                    if (!bestAdequate.found || capacity < bestAdequate.packetCapacity) {
+                        bestAdequate = candidate;
+                    }
+                } else if (!largestFallback.found ||
+                           capacity > largestFallback.packetCapacity) {
+                    largestFallback = candidate;
                 }
             }
         }
     }
-    return best;
+
+    if (bestAdequate.found) {
+        report << "Alt-setting choisi : plus petite capacité suffisante pour le payload UVC.\n";
+        return bestAdequate;
+    }
+    if (largestFallback.found) {
+        report << "AVERTISSEMENT : aucun alternate-setting ne couvre le payload demandé ; "
+               << "sélection de la meilleure capacité disponible pour le diagnostic.\n";
+        return largestFallback;
+    }
+    return {};
 }
 
 struct IsoStats {
@@ -467,9 +515,11 @@ std::string runProbe(int fd, int selectedMode, int durationMs) {
            << deviceDescriptor.idVendor << ":" << deviceDescriptor.idProduct
            << std::dec << "\n";
 
-    if (deviceDescriptor.idVendor != kPanasonicVid ||
-        deviceDescriptor.idProduct != (selectedMode == 1 ? kMotionDvPid : kWebcamPid)) {
-        report << "Le périphérique ouvert ne correspond pas au mode sélectionné.\n";
+    report << "PID USB : " << std::hex << std::uppercase
+           << deviceDescriptor.idProduct << std::dec
+           << " (informatif uniquement ; moteur choisi par le format UVC).\n";
+    if (deviceDescriptor.idVendor != kPanasonicVid) {
+        report << "Le VID du périphérique n'est pas Panasonic.\n";
         goto cleanup;
     }
 
@@ -545,6 +595,10 @@ std::string runProbe(int fd, int selectedMode, int durationMs) {
             report << "Réponse PROBE trop courte : " << result << " octets.\n";
             goto cleanup;
         }
+        if (probe[2] != format.formatIndex) {
+            report << "Le périphérique a renvoyé un index de format différent de celui annoncé.\n";
+            goto cleanup;
+        }
 
         const uint32_t maxFrameSize = readLe32(probe.data() + 18);
         const uint32_t maxPayload = readLe32(probe.data() + 22);
@@ -570,6 +624,10 @@ std::string runProbe(int fd, int selectedMode, int durationMs) {
         if (!endpoint.found) {
             report << "Aucun endpoint isochrone IN trouvé pour le flux vidéo.\n";
             goto cleanup;
+        }
+        if (maxPayload > endpoint.packetCapacity) {
+            report << "AVERTISSEMENT : capacité isochrone inférieure au payload UVC négocié ; "
+                   << "les données peuvent être partielles.\n";
         }
 
         result = libusb_set_interface_alt_setting(
