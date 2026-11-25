@@ -287,7 +287,7 @@ public class MainActivity extends Activity {
         root.addView(clearButton, fullWidthButton());
 
         TextView note = new TextView(this);
-        note.setText("L'aperçu décode DV ou MJPEG avec FFmpeg sur un thread séparé du transport USB. L'audio et sa synchronisation seront ajoutés après validation de l'image en direct.");
+        note.setText("Le moteur interne prépare automatiquement les vrais paquets USB (en-têtes UVC, reconstruction des images et décodage FFmpeg) avant l'affichage. Aucun mode simulateur ni aucune image de remplacement. L'audio et sa synchronisation seront ajoutés après validation de l'image en direct.");
         note.setTextColor(0xFF9AA8B7);
         note.setTextSize(12);
         note.setPadding(0, dp(8), 0, dp(10));
@@ -724,9 +724,9 @@ public class MainActivity extends Activity {
         append("\n--- APERÇU VIDÉO EN DIRECT ---\n");
         append("Moteur : " + selectedMode.label + " · arrêt manuel.\n");
         if (selectedMode == PanasonicMode.MOTION_DV) {
-            append("VCR/lecture et cassette en lecture requis. DV PAL attendu : 144 000 octets par trame.\n");
+            append("Mode VCR/lecture avec cassette en lecture requis. La taille exacte de trame (PAL/NTSC) est prise dans la négociation UVC.\n");
         } else {
-            append("Mode Webcam MJPEG : EBUSY a déjà bloqué la réservation de l'interface ; ce test permettra de confirmer si elle est libérée.\n");
+            append("Mode Webcam : le moteur interne reconstruit les images MJPEG annoncées par les descripteurs UVC.\n");
         }
         renderReport();
         updateNativeButton();
