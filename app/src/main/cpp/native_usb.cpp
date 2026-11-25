@@ -378,7 +378,7 @@ bool runIsoSample(libusb_context* ctx,
     }
 
     for (int i = 0; i < kTransferCount; ++i) {
-        libusb_transfer* transfer = libusb_alloc_transfer(kPacketsPerTransfer);
+        libusb_transfer* transfer = libusb_alloc_transfer(packetsPerTransfer);
         if (transfer == nullptr) {
             report << "Allocation d'un transfert isochrone impossible.\n";
             stats.stopping = true;
