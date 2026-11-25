@@ -514,6 +514,10 @@ std::string runProbe(int fd, int selectedMode, int durationMs) {
         libusb_exit(ctx);
         return report.str() + describeError("libusb_wrap_sys_device", result) + "\n";
     }
+    // libusb_wrap_sys_device() duplicates/retains its own descriptor reference.
+    // The caller keeps ownership of the supplied FD and must close this dup.
+    // The upstream testlibusb example closes its fd immediately after wrapping.
+    close(ownedFd);
 
     bool interfaceClaimed = false;
     bool manuallyDetachedKernelDriver = false;
