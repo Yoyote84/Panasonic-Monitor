@@ -12,6 +12,10 @@
 #include <sys/time.h>
 #include <vector>
 #include <unistd.h>
+#include <cerrno>
+#include <cstdio>
+#include <sys/ioctl.h>
+#include <linux/usbdevice_fs.h>
 
 namespace {
 
@@ -516,10 +520,8 @@ std::string runProbe(int fd, int selectedMode, int durationMs) {
         libusb_exit(ctx);
         return report.str() + describeError("libusb_wrap_sys_device", result) + "\n";
     }
-    // libusb_wrap_sys_device() duplicates/retains its own descriptor reference.
-    // The caller keeps ownership of the supplied FD and must close this dup.
-    // The upstream testlibusb example closes its fd immediately after wrapping.
-    close(ownedFd);
+    // Keep the duplicated Android FD until interface diagnostics are complete.
+    // libusb_wrap_sys_device() retains its own reference.
 
     bool interfaceClaimed = false;
     bool manuallyDetachedKernelDriver = false;
@@ -589,6 +591,28 @@ std::string runProbe(int fd, int selectedMode, int durationMs) {
                 report << describeError("libusb_detach_kernel_driver", detachResult) << "\n";
             }
         }
+    }
+
+    // Probe the Android USBFS claim ioctl directly on the caller-owned FD copy.
+    // Claim and release immediately: this records the kernel errno separately
+    // from libusb's mapping, without retaining a parallel interface ownership.
+    unsigned int probeInterface = static_cast<unsigned int>(format.interfaceNumber);
+    errno = 0;
+    const int rawClaimResult = ioctl(ownedFd, USBDEVFS_CLAIMINTERFACE, &probeInterface);
+    const int rawClaimErrno = rawClaimResult < 0 ? errno : 0;
+    if (rawClaimResult == 0) {
+        report << "Diagnostic USBFS ioctl CLAIMINTERFACE : succès.\n";
+        errno = 0;
+        const int rawReleaseResult = ioctl(ownedFd, USBDEVFS_RELEASEINTERFACE, &probeInterface);
+        if (rawReleaseResult < 0) {
+            report << "Diagnostic USBFS ioctl RELEASEINTERFACE : errno=" << errno
+                   << " (" << strerror(errno) << ").\n";
+        } else {
+            report << "Diagnostic USBFS ioctl RELEASEINTERFACE : succès.\n";
+        }
+    } else {
+        report << "Diagnostic USBFS ioctl CLAIMINTERFACE : errno=" << rawClaimErrno
+               << " (" << strerror(rawClaimErrno) << ").\n";
     }
 
     result = libusb_claim_interface(handle, format.interfaceNumber);
@@ -755,6 +779,7 @@ std::string runProbe(int fd, int selectedMode, int durationMs) {
     }
 
 cleanup:
+    close(ownedFd);
     if (config != nullptr) {
         libusb_free_config_descriptor(config);
     }
