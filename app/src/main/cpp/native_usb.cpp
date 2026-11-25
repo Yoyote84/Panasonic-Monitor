@@ -33,7 +33,10 @@ constexpr uint8_t kVsProbeControl = 0x01;
 constexpr uint8_t kVsCommitControl = 0x02;
 
 constexpr int kTransferCount = 32;
-constexpr int kPacketsPerTransfer = 128;
+constexpr int kMaxPacketsPerTransfer = 128;
+// Keep each Linux usbfs URB below the conservative 16 KiB Android allocation
+// ceiling reported by libusb users. 15 KiB leaves a little room for overhead.
+constexpr uint32_t kMaxAndroidUrbBytes = 15U * 1024U;
 constexpr int kSampleDurationMsDefault = 5000;
 
 uint16_t readLe16(const unsigned char* p) {
@@ -361,6 +364,19 @@ bool runIsoSample(libusb_context* ctx,
     std::vector<TransferState> states(kTransferCount);
     transfers.reserve(kTransferCount);
 
+    const uint32_t safePackets = endpoint.packetCapacity == 0
+            ? 1U : (kMaxAndroidUrbBytes / endpoint.packetCapacity);
+    const int packetsPerTransfer = std::max(1, std::min(
+            kMaxPacketsPerTransfer, static_cast<int>(safePackets)));
+    const uint64_t bytesPerTransfer =
+            static_cast<uint64_t>(endpoint.packetCapacity) * packetsPerTransfer;
+    report << "Dimensionnement Android USBFS : " << packetsPerTransfer
+           << " paquets/transfert · " << bytesPerTransfer
+           << " octets/URB (plafond cible " << kMaxAndroidUrbBytes << ").\n";
+    if (bytesPerTransfer > kMaxAndroidUrbBytes) {
+        report << "AVERTISSEMENT : un paquet seul dépasse le plafond URB Android prudent.\n";
+    }
+
     for (int i = 0; i < kTransferCount; ++i) {
         libusb_transfer* transfer = libusb_alloc_transfer(kPacketsPerTransfer);
         if (transfer == nullptr) {
@@ -369,8 +385,7 @@ bool runIsoSample(libusb_context* ctx,
             break;
         }
 
-        const int bufferLength =
-            static_cast<int>(endpoint.packetCapacity) * kPacketsPerTransfer;
+        const int bufferLength = static_cast<int>(bytesPerTransfer);
         unsigned char* buffer = static_cast<unsigned char*>(std::malloc(static_cast<size_t>(bufferLength)));
         if (buffer == nullptr) {
             libusb_free_transfer(transfer);
@@ -387,7 +402,7 @@ bool runIsoSample(libusb_context* ctx,
             endpoint.address,
             buffer,
             bufferLength,
-            kPacketsPerTransfer,
+            packetsPerTransfer,
             isoCallback,
             &states[static_cast<size_t>(i)],
             0
@@ -501,6 +516,7 @@ std::string runProbe(int fd, int selectedMode, int durationMs) {
     }
 
     bool interfaceClaimed = false;
+    bool manuallyDetachedKernelDriver = false;
     libusb_config_descriptor* config = nullptr;
     libusb_device_descriptor deviceDescriptor {};
     const bool wantDv = selectedMode == 1;
@@ -536,10 +552,76 @@ std::string runProbe(int fd, int selectedMode, int durationMs) {
         goto cleanup;
     }
 
+    // Diagnose and, when supported, detach a kernel driver only for the UVC
+    // VideoStreaming interface selected from the descriptors. Audio interfaces
+    // and the VideoControl interface are deliberately left untouched.
+    const int kernelDriverBefore =
+            libusb_kernel_driver_active(handle, format.interfaceNumber);
+    if (kernelDriverBefore == 1) {
+        report << "Pilote noyau actif sur VideoStreaming : oui.\n";
+    } else if (kernelDriverBefore == 0) {
+        report << "Pilote noyau actif sur VideoStreaming : non.\n";
+    } else {
+        report << "État du pilote noyau indéterminé : "
+               << describeError("libusb_kernel_driver_active", kernelDriverBefore) << "\n";
+    }
+
+    const int autoDetachResult = libusb_set_auto_detach_kernel_driver(handle, 1);
+    if (autoDetachResult == LIBUSB_SUCCESS) {
+        report << "Récupération automatique du pilote noyau activée pour l'interface vidéo.\n";
+    } else {
+        report << describeError("libusb_set_auto_detach_kernel_driver", autoDetachResult) << "\n";
+        if (kernelDriverBefore == 1) {
+            const int detachResult =
+                    libusb_detach_kernel_driver(handle, format.interfaceNumber);
+            if (detachResult == LIBUSB_SUCCESS) {
+                manuallyDetachedKernelDriver = true;
+                report << "Pilote noyau vidéo détaché explicitement (interface "
+                       << format.interfaceNumber << ").\n";
+            } else if (detachResult != LIBUSB_ERROR_NOT_FOUND) {
+                report << describeError("libusb_detach_kernel_driver", detachResult) << "\n";
+            }
+        }
+    }
+
     result = libusb_claim_interface(handle, format.interfaceNumber);
+    if (result == LIBUSB_ERROR_BUSY) {
+        const int kernelDriverAfter =
+                libusb_kernel_driver_active(handle, format.interfaceNumber);
+        if (kernelDriverAfter == 1 && !manuallyDetachedKernelDriver) {
+            report << "L'interface reste occupée avec un pilote noyau actif ; "
+                      "tentative de détachement ciblé puis nouvelle réservation.\n";
+            // Disable libusb's automatic path before performing and tracking
+            // the detach explicitly, so cleanup can reliably reattach it.
+            libusb_set_auto_detach_kernel_driver(handle, 0);
+            const int detachResult =
+                    libusb_detach_kernel_driver(handle, format.interfaceNumber);
+            if (detachResult == LIBUSB_SUCCESS) {
+                manuallyDetachedKernelDriver = true;
+                result = libusb_claim_interface(handle, format.interfaceNumber);
+            } else {
+                report << describeError("Détachement ciblé du pilote noyau", detachResult) << "\n";
+            }
+        }
+    }
     if (result != LIBUSB_SUCCESS) {
+        const int kernelDriverAfter =
+                libusb_kernel_driver_active(handle, format.interfaceNumber);
         report << describeError("libusb_claim_interface", result) << "\n";
-        report << "Vérifie qu'aucune autre application USB n'utilise le caméscope.\n";
+        if (result == LIBUSB_ERROR_BUSY) {
+            report << "Diagnostic : l'interface VideoStreaming est déjà réservée. "
+                      "Un pilote noyau encore actif ou un autre propriétaire USB "
+                      "(processus/service) peut provoquer ce conflit.\n";
+            if (kernelDriverAfter == 0) {
+                report << "Le pilote noyau n'est pas actif après la tentative : "
+                          "un propriétaire en espace utilisateur est plus probable.\n";
+            } else if (kernelDriverAfter == 1) {
+                report << "Le pilote noyau reste actif ; Android/libusb n'a pas pu le détacher.\n";
+            } else {
+                report << "Android ne permet pas de déterminer le propriétaire de l'interface.\n";
+            }
+            report << "Seule l'interface vidéo a été ciblée ; aucune interface audio n'a été détachée.\n";
+        }
         goto cleanup;
     }
     interfaceClaimed = true;
@@ -639,8 +721,7 @@ std::string runProbe(int fd, int selectedMode, int durationMs) {
                << static_cast<int>(endpoint.address) << std::dec
                << " · paquet " << endpoint.packetCapacity << " octets\n";
         report << "Échantillonnage isochrone : " << durationMs << " ms"
-               << " · " << kTransferCount << " transferts × "
-               << kPacketsPerTransfer << " paquets\n";
+               << " · " << kTransferCount << " transferts\n";
 
         IsoStats stats;
         const bool received = runIsoSample(ctx, handle, endpoint, durationMs, stats, report);
@@ -670,7 +751,18 @@ cleanup:
         libusb_free_config_descriptor(config);
     }
     if (interfaceClaimed) {
-        libusb_release_interface(handle, format.interfaceNumber);
+        const int releaseResult = libusb_release_interface(handle, format.interfaceNumber);
+        if (releaseResult != LIBUSB_SUCCESS) {
+            report << describeError("libusb_release_interface", releaseResult) << "\n";
+        }
+    }
+    if (manuallyDetachedKernelDriver) {
+        const int attachResult = libusb_attach_kernel_driver(handle, format.interfaceNumber);
+        if (attachResult != LIBUSB_SUCCESS && attachResult != LIBUSB_ERROR_NOT_FOUND) {
+            report << describeError("libusb_attach_kernel_driver (restauration)", attachResult) << "\n";
+        } else if (attachResult == LIBUSB_SUCCESS) {
+            report << "Pilote noyau vidéo restauré après le test.\n";
+        }
     }
     libusb_close(handle);
     libusb_exit(ctx);
