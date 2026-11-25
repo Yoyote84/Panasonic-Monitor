@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 #include <string>
@@ -322,7 +323,7 @@ bool runIsoSample(libusb_context* ctx,
 
         const int bufferLength =
             static_cast<int>(endpoint.packetCapacity) * kPacketsPerTransfer;
-        unsigned char* buffer = new (std::nothrow) unsigned char[bufferLength];
+        unsigned char* buffer = static_cast<unsigned char*>(std::malloc(static_cast<size_t>(bufferLength)));
         if (buffer == nullptr) {
             libusb_free_transfer(transfer);
             report << "Allocation du tampon isochrone impossible.\n";
