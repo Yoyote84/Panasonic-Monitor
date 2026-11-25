@@ -80,6 +80,45 @@ La version 0.2.1 ajoute ou corrige :
 - `Flags d'erreur UVC` : paquets marqués en erreur par le périphérique ; ce compteur n'est pas à lui seul une mesure de corruption d'image.
 - Aucun payload : vérifier la personnalité USB, le mode caméra/lecture, l'alimentation et le câble. Cela ne prouve pas à lui seul que le format est incompatible.
 
+## Étape 3 — Décodage et aperçu vidéo en direct
+
+Cette branche ouvre le travail de l'étape 3 sans déclarer l'étape 2 terminée. Le transport DV a déjà livré un payload réel sur le Galaxy Z Flip 6 ; la réservation Webcam MJPEG reste bloquée par `EBUSY` dans le dernier rapport matériel.
+
+### Chaîne vidéo ajoutée
+
+- Le transport libusb conserve les transferts isochrones et transmet chaque paquet UVC avec son en-tête au décodeur.
+- Le callback USB ne décode pas : il copie les données dans un tampon circulaire SPSC borné de 8 Mio. En cas de saturation, les pertes sont comptées et l'assembleur est resynchronisé.
+- Le moteur DV synchronise les trames PAL de 144 000 octets ou NTSC de 120 000 octets sur la signature `1F 07 00`.
+- Le moteur MJPEG assemble les payloads à l'aide des bits UVC FID et EOF.
+- FFmpeg 9.1 décode DV/MJPEG ; libswscale convertit les images en RGBA et une Surface Android les affiche.
+- L'arrêt annule les transferts isochrones, attend leurs callbacks, vide le tampon restant et ferme l'interface avant de libérer le descripteur USB.
+- Les paquets marqués UVC ERR sont conservés : ces bits peuvent être présents sur des payloads DV exploitables pendant la synchronisation de lecture.
+
+Le mode aperçu est continu jusqu'à ce que l'utilisateur appuie sur **Arrêter l'aperçu** ou que l'activité perde son écran. La détection USB et le test de transport de cinq secondes restent disponibles pour le diagnostic.
+
+### Compilation FFmpeg Android
+
+Le workflow compile FFmpeg 9.1 depuis le commit amont exact `74e4393595cf2b5857f0da925c4e0dd74ea306e5`, cible `arm64-v8a`, puis génère l'APK :
+
+```bash
+export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.2.12479018"
+bash scripts/build-ffmpeg-android.sh
+gradle :app:testDebugUnitTest :app:assembleDebug
+```
+
+La compilation utilise les bibliothèques partagées LGPL et n'active ni les composants GPL ni les composants non-free. Voir [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) et [la licence FFmpeg](licenses/FFmpeg-COPYING.LGPLv2.1).
+
+### Validation matérielle encore nécessaire
+
+1. Sur le NV-GS140, choisir **Motion DV**, passer en VCR/lecture et lancer une cassette.
+2. Dans l'application, choisir **Monitor DV / Motion DV**, détecter le caméscope, puis démarrer l'aperçu.
+3. Confirmer que l'image apparaît et reste fluide pendant plusieurs minutes.
+4. Arrêter l'aperçu et partager le rapport : trames décodées/affichées, pertes de tampon, flags ERR, erreurs de décodage et libération libusb.
+5. Refaire l'essai après débranchement/rebranchement.
+6. Répéter en Webcam MJPEG après résolution du conflit `EBUSY`.
+
+**Limite actuelle :** cette première livraison de l'étape 3 traite l'image uniquement. Le flux audio USB, l'horodatage commun et la synchronisation audio/vidéo ne sont pas encore implémentés ni validés. Aucun enregistrement vidéo ou MP4 n'est produit à ce stade. L'étape 3 reste donc en cours jusqu'au décodage vérifié sur le caméscope et à la synchronisation A/V.
+
 ## Compilation
 
 Le workflow GitHub Actions compile les tests Java et l'APK arm64 avec JDK 17, Android SDK 35, NDK 27.2.12479018, CMake 3.22.1 et Gradle 8.13.
