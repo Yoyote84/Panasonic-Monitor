@@ -39,7 +39,15 @@ La version 0.2.1 ajoute ou corrige :
 - diagnostic de l'état d'un éventuel pilote noyau et détachement automatique ciblé de la seule interface VideoStreaming pendant sa réservation, avec restauration à la libération ; les interfaces VideoControl et audio ne sont pas détachées ;
 - dimensionnement adaptatif des URB isochrones sous un plafond prudent de 15 Kio par transfert pour éviter les limites USBFS/mémoire observées sur Android récent.
 
-**Cette étape ne décode pas encore l'image, n'affiche pas la vidéo et n'enregistre aucun fichier.** Elle vérifie que le téléphone peut ouvrir le périphérique, négocier le flux UVC et recevoir des données isochrones. Les transferts doivent encore être validés sur le NV-GS140 physique : une compilation réussie ne remplace pas le test matériel.
+**Cette étape ne décode pas encore l'image, n'affiche pas la vidéo et n'enregistre aucun fichier.** Elle vérifie que le téléphone peut ouvrir le périphérique, négocier le flux UVC et recevoir des données isochrones. Les transferts doivent être validés sur le NV-GS140 physique : une compilation réussie ne remplace pas le test matériel.
+
+#### État de validation matériel — 25 novembre 2026
+
+- **Monitor DV : transport positif.** Sur Galaxy Z Flip 6 + NV-GS140, le caméscope a annoncé `VS_FORMAT_DV`, accepté PROBE/COMMIT et livré 17 823 840 octets de payload UVC (37 133 paquets avec données) pendant l'échantillonnage de cinq secondes. Les erreurs de paquets et de soumission étaient toutes deux à zéro. Les 7 200 flags UVC `ERR` sont comptés à part et ne sont pas assimilés à des erreurs USB de transfert.
+- **Nettoyage libusb : correction logicielle poussée.** Le FD fourni à `libusb_wrap_sys_device()` est désormais gardé ouvert jusqu'après `libusb_close()`, et l'interface est libérée avant la fermeture du handle. Ce correctif doit encore être confirmé par un nouveau test sur le caméscope, notamment l'absence de l'erreur de libération observée précédemment.
+- **Webcam MJPEG : validation matérielle manquante.** Les descripteurs MJPEG sont annoncés, mais il faut encore obtenir un payload UVC non nul sur ce mode avec la nouvelle version.
+
+**Conclusion : l'étape 2 est avancée et le transport DV est validé, mais elle n'est pas encore déclarée complète.** Il manque la confirmation du nettoyage après le correctif et un échantillon positif du moteur Webcam MJPEG.
 
 ### Test sur le Galaxy Z Flip 6
 
@@ -52,6 +60,7 @@ La version 0.2.1 ajoute ou corrige :
 7. Touche **Tester le transport natif (5 secondes)**.
 8. Pour Monitor DV, commence en mode VCR/lecture avec une cassette réellement en lecture. Un flux DV peut ne pas arriver si le transport de bande n'est pas lancé.
 9. Partage le rapport complet. Répète le test avec l'autre moteur.
+10. Après chaque test, vérifie que le rapport ne contient plus d'erreur `libusb_release_interface`, puis débranche/rebranche le caméscope et relance un test pour confirmer que l'interface est bien rendue et récupérable.
 
 ### Comment interpréter le test natif
 
@@ -83,7 +92,7 @@ APK : `app/build/outputs/apk/debug/app-debug.apk`
 ## Feuille de route en 5 étapes
 
 1. Diagnostic USB et identification des formats annoncés par le NV-GS140 — réalisé avec les rapports de test.
-2. Transport natif UVC-DV / Webcam et échantillonnage isochrone — correctifs logiciels ajoutés ; validation sur les deux modes matériels encore requise.
+2. Transport natif UVC-DV / Webcam et échantillonnage isochrone — transport DV validé sur matériel ; correction du nettoyage libusb poussée ; validation Webcam MJPEG et nouveau test de libération/reconnexion encore requis.
 3. Décodage, aperçu en direct et synchronisation audio/vidéo.
 4. Enregistrement DV original, MP4 et bibliothèque de médias.
 5. Stabilité, reconnexion, optimisation, tests finaux et APK final.
