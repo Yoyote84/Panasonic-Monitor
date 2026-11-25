@@ -106,6 +106,7 @@ public class MainActivity extends Activity {
             renderReport();
             refreshStatus();
             updateNativeButton();
+            updatePreviewButtons();
             requestNextUsbPermission();
         }
     };
@@ -373,6 +374,10 @@ public class MainActivity extends Activity {
     }
 
     private void scanConnectedDevices() {
+        if (previewRunning) {
+            Toast.makeText(this, "Arrête l'aperçu avant de relancer la détection USB.", Toast.LENGTH_SHORT).show();
+            return;
+        }
         report.setLength(0);
         permissionQueue.clear();
         waitingForUsbPermission = false;
@@ -399,6 +404,7 @@ public class MainActivity extends Activity {
             renderReport();
             refreshStatus();
             updateNativeButton();
+            updatePreviewButtons();
             return;
         }
 
@@ -426,6 +432,7 @@ public class MainActivity extends Activity {
         renderReport();
         refreshStatus();
         updateNativeButton();
+            updatePreviewButtons();
         requestNextUsbPermission();
     }
 
@@ -508,6 +515,7 @@ public class MainActivity extends Activity {
         if (waitingForUsbPermission || pendingCameraDevice != null || permissionQueue.isEmpty()) {
             renderReport();
             updateNativeButton();
+            updatePreviewButtons();
             return;
         }
 
@@ -535,6 +543,7 @@ public class MainActivity extends Activity {
             appendModeCompatibility(device);
             renderReport();
             updateNativeButton();
+            updatePreviewButtons();
             return;
         }
 
@@ -609,6 +618,7 @@ public class MainActivity extends Activity {
 
         testRunning = true;
         updateNativeButton();
+            updatePreviewButtons();
         append("\n--- TEST NATIF UVC / ISOCHRONE ---\n");
         append("Mode : " + selectedMode.label + " · échantillonnage demandé : 5 secondes\n");
         if (selectedMode == PanasonicMode.MOTION_DV) {
