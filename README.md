@@ -88,7 +88,7 @@ Cette branche ouvre le travail de l'étape 3 sans déclarer l'étape 2 terminée
 
 - Le transport libusb conserve les transferts isochrones et transmet chaque paquet UVC avec son en-tête au décodeur.
 - Le callback USB ne décode pas : il copie les données dans un tampon circulaire SPSC borné de 8 Mio. En cas de saturation, les pertes sont comptées et l'assembleur est resynchronisé.
-- Le moteur DV synchronise les trames PAL de 144 000 octets ou NTSC de 120 000 octets sur la signature `1F 07 00`.
+- Le moteur DV conserve les bits `FID` et `EOF` de chaque en-tête UVC. Le bit `FID` (frontière obligatoire pour DV) déclenche la fin de la trame précédente ; le bit `EOF`, lorsqu'il est fourni, permet de la terminer plus tôt. Une trame n'est envoyée à FFmpeg que si sa taille correspond exactement au format négocié : 144 000 octets en PAL ou 120 000 octets en NTSC. Les trames incomplètes ou trop longues sont rejetées.
 - Le moteur MJPEG assemble les payloads à l'aide des bits UVC FID et EOF.
 - FFmpeg 9.1 décode DV/MJPEG ; libswscale convertit les images en RGBA et une Surface Android les affiche.
 - L'arrêt annule les transferts isochrones, attend leurs callbacks, vide le tampon restant et ferme l'interface avant de libérer le descripteur USB.
