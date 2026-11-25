@@ -392,7 +392,7 @@ public class MainActivity extends Activity {
 
         String timestamp = new SimpleDateFormat(
                 "yyyy-MM-dd HH:mm:ss Z", Locale.FRANCE).format(new Date());
-        append("PANASONIC MONITOR — RAPPORT ÉTAPE 2\n");
+        append("PANASONIC MONITOR — RAPPORT ÉTAPE 3\n");
         append("Date du test : " + timestamp + "\n");
         append("Téléphone : " + Build.MANUFACTURER + " " + Build.MODEL
                 + " · Android " + Build.VERSION.RELEASE
