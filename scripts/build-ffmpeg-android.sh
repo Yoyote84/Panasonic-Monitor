@@ -90,7 +90,6 @@ cd "${FFMPEG_DIR}"
   --disable-avformat \
   --disable-avdevice \
   --disable-swresample \
-  --disable-postproc
 
 JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)}"
 make -j"${JOBS}"
