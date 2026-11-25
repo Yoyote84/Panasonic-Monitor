@@ -38,7 +38,7 @@ public final class UsbDescriptorParser {
             out.append("Interface UVC VideoStreaming : ").append(yesNo(hasVideoStreaming)).append('\n');
             out.append("Format UVC DV (VS_FORMAT_DV 0x0C) : ").append(yesNo(hasDvFormat)).append('\n');
             out.append("Format UVC MJPEG (VS_FORMAT_MJPEG 0x06) : ").append(yesNo(hasMjpegFormat)).append('\n');
-            out.append("Point de terminaison vidéo isochrone : ")
+            out.append("Point de terminaison vidéo isochrone IN : ")
                     .append(yesNo(hasIsochronousVideoEndpoint)).append('\n');
             if (malformed) {
                 out.append("ATTENTION : descripteurs incomplets ou mal formés détectés.\n");
@@ -137,7 +137,8 @@ public final class UsbDescriptorParser {
                         + " maxPacket=" + packetSize;
                 if (currentClass == USB_CLASS_VIDEO
                         && currentSubclass == USB_SUBCLASS_VIDEO_STREAMING
-                        && transferType == 1) {
+                        && transferType == 1
+                        && (address & 0x80) != 0) {
                     result.hasIsochronousVideoEndpoint = true;
                 }
             }

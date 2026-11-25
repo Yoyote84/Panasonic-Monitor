@@ -36,6 +36,35 @@ public class UsbDescriptorParserTest {
     }
 
     @Test
+    public void webcamEngineRequiresUvcMjpegDescriptor() {
+        UsbDescriptorParser.ParseResult mjpeg =
+                UsbDescriptorParser.parse(sampleDescriptors(0x06));
+        UsbDescriptorParser.ParseResult dv =
+                UsbDescriptorParser.parse(sampleDescriptors(0x0C));
+
+        assertTrue(PanasonicMode.WEBCAM.isAdvertisedBy(mjpeg));
+        assertFalse(PanasonicMode.WEBCAM.isAdvertisedBy(dv));
+    }
+
+    @Test
+    public void monitorDvEngineRequiresUvcDvDescriptor() {
+        UsbDescriptorParser.ParseResult dv =
+                UsbDescriptorParser.parse(sampleDescriptors(0x0C));
+        UsbDescriptorParser.ParseResult mjpeg =
+                UsbDescriptorParser.parse(sampleDescriptors(0x06));
+
+        assertTrue(PanasonicMode.MOTION_DV.isAdvertisedBy(dv));
+        assertFalse(PanasonicMode.MOTION_DV.isAdvertisedBy(mjpeg));
+    }
+
+    @Test
+    public void ignoresIsochronousOutEndpointForVideoInput() {
+        UsbDescriptorParser.ParseResult result =
+                UsbDescriptorParser.parse(sampleDescriptorsWithEndpointAddress(0x01));
+        assertFalse(result.hasIsochronousVideoEndpoint);
+    }
+
+    @Test
     public void handlesTruncatedDescriptorWithoutCrashing() {
         UsbDescriptorParser.ParseResult result =
                 UsbDescriptorParser.parse(new byte[]{9, 2, 0});
@@ -63,12 +92,16 @@ public class UsbDescriptorParserTest {
     }
 
     private byte[] sampleDescriptorsWithIsoEndpoint() {
+        return sampleDescriptorsWithEndpointAddress(0x81);
+    }
+
+    private byte[] sampleDescriptorsWithEndpointAddress(int address) {
         return new byte[]{
                 18, 1, 0, 2, 0, 0, 0, 64, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1,
                 9, 2, 34, 0, 1, 1, 0, (byte) 0x80, 50,
                 9, 4, 1, 0, 1, 14, 2, 0, 0,
                 7, 0x24, 0x0C, 0, 0, 0, 0,
-                7, 5, (byte) 0x81, 1, 0, 4, 1
+                7, 5, (byte) address, 1, 0, 4, 1
         };
     }
 }
