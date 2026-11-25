@@ -173,7 +173,8 @@ struct PreviewDecoder::Impl {
         }
 
         if (dvMode) {
-            dvFrame.resize(negotiatedFrameSize);
+            dvFrame.clear();
+            dvFrame.reserve(negotiatedFrameSize);
         }
         stopping.store(false, std::memory_order_release);
         running.store(true, std::memory_order_release);
@@ -212,28 +213,24 @@ struct PreviewDecoder::Impl {
         const size_t payloadLength = length - headerLength;
         if (payloadLength == 0) return true;
 
-        bool written = false;
-        if (dvMode) {
-            written = ring.write(payload, payloadLength);
-        } else {
-            // Keep UVC FID/EOF beside each payload while passing it to the
-            // worker; USB callbacks do not assemble or decode JPEG frames.
-            constexpr size_t kRecordHeader = 3;
-            if (payloadLength > std::numeric_limits<uint16_t>::max()) {
-                queueDrops.fetch_add(1, std::memory_order_relaxed);
-                return false;
-            }
-            std::array<uint8_t, 16384> record{};
-            if (payloadLength + kRecordHeader > record.size()) {
-                queueDrops.fetch_add(1, std::memory_order_relaxed);
-                return false;
-            }
-            record[0] = flags;
-            record[1] = static_cast<uint8_t>(payloadLength & 0xFF);
-            record[2] = static_cast<uint8_t>((payloadLength >> 8) & 0xFF);
-            std::memcpy(record.data() + kRecordHeader, payload, payloadLength);
-            written = ring.write(record.data(), payloadLength + kRecordHeader);
+        // Preserve the UVC payload-header flags for both DV and MJPEG.
+        // FID is mandatory for frame-based formats such as DV; EOF is optional.
+        // Frame assembly remains on the worker thread, never in the USB callback.
+        constexpr size_t kRecordHeader = 3;
+        if (payloadLength > std::numeric_limits<uint16_t>::max()) {
+            queueDrops.fetch_add(1, std::memory_order_relaxed);
+            return false;
         }
+        std::array<uint8_t, 16384> record{};
+        if (payloadLength + kRecordHeader > record.size()) {
+            queueDrops.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        record[0] = flags;
+        record[1] = static_cast<uint8_t>(payloadLength & 0xFF);
+        record[2] = static_cast<uint8_t>((payloadLength >> 8) & 0xFF);
+        std::memcpy(record.data() + kRecordHeader, payload, payloadLength);
+        const bool written = ring.write(record.data(), payloadLength + kRecordHeader);
 
         if (!written) {
             queueDrops.fetch_add(1, std::memory_order_relaxed);
@@ -282,8 +279,8 @@ struct PreviewDecoder::Impl {
 private:
     void workerMain() {
         std::array<uint8_t, kWorkerChunkBytes> chunk{};
-        std::vector<uint8_t> mjpegRecords;
-        mjpegRecords.reserve(64U * 1024U);
+        std::vector<uint8_t> uvcRecords;
+        uvcRecords.reserve(64U * 1024U);
 
         while (!stopping.load(std::memory_order_acquire) || ring.available() > 0) {
             const size_t count = ring.read(chunk.data(), chunk.size());
@@ -296,12 +293,12 @@ private:
                 resetAssemblers();
             }
 
+            uvcRecords.insert(uvcRecords.end(), chunk.begin(),
+                              chunk.begin() + static_cast<std::ptrdiff_t>(count));
             if (dvMode) {
-                feedDvBytes(chunk.data(), count);
+                consumeDvRecords(uvcRecords);
             } else {
-                mjpegRecords.insert(mjpegRecords.end(), chunk.begin(),
-                                     chunk.begin() + static_cast<std::ptrdiff_t>(count));
-                consumeMjpegRecords(mjpegRecords);
+                consumeMjpegRecords(uvcRecords);
             }
         }
         // Deliberately discard an incomplete final frame on stop. A partial
@@ -309,43 +306,90 @@ private:
     }
 
     void resetAssemblers() {
-        dvSynced = false;
-        dvHave = 0;
-        dvSyncMatch = 0;
+        dvFrame.clear();
+        dvFid = -1;
+        dvDropUntilBoundary = false;
         jpegFrame.clear();
         jpegFid = -1;
         jpegDropUntilBoundary = false;
     }
 
-    void feedDvBytes(const uint8_t* bytes, size_t length) {
-        for (size_t i = 0; i < length; ++i) {
-            const uint8_t value = bytes[i];
-            if (!dvSynced) {
-                if (dvSyncMatch == 0) {
-                    dvSyncMatch = value == 0x1F ? 1 : 0;
-                } else if (dvSyncMatch == 1) {
-                    dvSyncMatch = value == 0x07 ? 2 : (value == 0x1F ? 1 : 0);
-                } else {
-                    if (value == 0x00) {
-                        dvFrame[0] = 0x1F;
-                        dvFrame[1] = 0x07;
-                        dvFrame[2] = 0x00;
-                        dvHave = 3;
-                        dvSynced = true;
-                    } else {
-                        dvSyncMatch = value == 0x1F ? 1 : 0;
-                    }
-                }
-                continue;
+    void consumeDvRecords(std::vector<uint8_t>& records) {
+        constexpr size_t kRecordHeader = 3;
+        size_t consumed = 0;
+        while (records.size() - consumed >= kRecordHeader) {
+            const uint8_t flags = records[consumed];
+            const size_t payloadLength =
+                    static_cast<size_t>(records[consumed + 1])
+                    | (static_cast<size_t>(records[consumed + 2]) << 8);
+            if (records.size() - consumed < kRecordHeader + payloadLength) {
+                break;
             }
+            if (payloadLength > 0) {
+                pushDvPayload(flags, records.data() + consumed + kRecordHeader,
+                              payloadLength);
+            }
+            consumed += kRecordHeader + payloadLength;
+        }
 
-            dvFrame[dvHave++] = value;
-            if (dvHave == negotiatedFrameSize) {
-                decodeFrame(dvFrame.data(), dvFrame.size());
-                dvHave = 0;
-                dvSynced = false;
-                dvSyncMatch = 0;
+        if (consumed > 0) {
+            records.erase(records.begin(),
+                          records.begin() + static_cast<std::ptrdiff_t>(consumed));
+        }
+        if (records.size() > 2U * 1024U * 1024U) {
+            records.clear();
+            dvFrame.clear();
+            dvDropUntilBoundary = true;
+            assemblyDrops.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    void finishDvFrame() {
+        if (dvDropUntilBoundary) {
+            dvFrame.clear();
+            dvDropUntilBoundary = false;
+            return;
+        }
+        if (dvFrame.empty()) {
+            return;
+        }
+
+        if (dvFrame.size() == negotiatedFrameSize) {
+            decodeFrame(dvFrame.data(), dvFrame.size());
+        } else {
+            // Never send a truncated or overrun DV frame to FFmpeg.
+            assemblyDrops.fetch_add(1, std::memory_order_relaxed);
+        }
+        dvFrame.clear();
+    }
+
+    void pushDvPayload(uint8_t flags, const uint8_t* payload, size_t length) {
+        const int fid = (flags & kUvcFid) != 0 ? 1 : 0;
+
+        if (dvFid < 0) {
+            dvFid = fid;
+        } else if (fid != dvFid) {
+            // UVC FID toggles at the beginning of each frame. It is the
+            // mandatory frame boundary for frame-based formats such as DV.
+            finishDvFrame();
+            dvFid = fid;
+        }
+
+        if (!dvDropUntilBoundary) {
+            if (dvFrame.size() > negotiatedFrameSize
+                    || length > negotiatedFrameSize - dvFrame.size()) {
+                dvFrame.clear();
+                dvDropUntilBoundary = true;
+                assemblyDrops.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                dvFrame.insert(dvFrame.end(), payload, payload + length);
             }
+        }
+
+        // EOF is optional in UVC. Use it when supplied, while keeping FID
+        // toggling as the fallback boundary for devices that omit EOF.
+        if ((flags & kUvcEof) != 0) {
+            finishDvFrame();
         }
     }
 
@@ -542,9 +586,8 @@ private:
     SwsContext* sws = nullptr;
 
     std::vector<uint8_t> dvFrame;
-    size_t dvHave = 0;
-    int dvSyncMatch = 0;
-    bool dvSynced = false;
+    int dvFid = -1;
+    bool dvDropUntilBoundary = false;
 
     std::vector<uint8_t> jpegFrame;
     int jpegFid = -1;
