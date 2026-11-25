@@ -19,8 +19,6 @@
 
 namespace {
 
-constexpr uint16_t kPanasonicVid = 0x04DA;
-
 constexpr uint8_t kUsbClassVideo = 0x0E;
 constexpr uint8_t kUsbSubclassVideoStreaming = 0x02;
 constexpr uint8_t kCsInterface = 0x24;
@@ -520,8 +518,8 @@ std::string runProbe(int fd, int selectedMode, int durationMs) {
         libusb_exit(ctx);
         return report.str() + describeError("libusb_wrap_sys_device", result) + "\n";
     }
-    // Keep the duplicated Android FD until interface diagnostics are complete.
-    // libusb_wrap_sys_device() retains its own reference.
+    // libusb_wrap_sys_device() uses this exact FD; it does not duplicate or
+    // close it. Keep ownedFd open until after libusb_close(handle).
 
     bool interfaceClaimed = false;
     bool manuallyDetachedKernelDriver = false;
@@ -538,11 +536,6 @@ std::string runProbe(int fd, int selectedMode, int durationMs) {
     report << "USB VID:PID : " << std::hex << std::uppercase
            << deviceDescriptor.idVendor << ":" << deviceDescriptor.idProduct
            << std::dec << " (PID informatif ; moteur choisi par le format UVC).\n";
-    if (deviceDescriptor.idVendor != kPanasonicVid) {
-        report << "Le VID du périphérique n'est pas Panasonic.\n";
-        goto cleanup;
-    }
-
     result = libusb_get_active_config_descriptor(libusb_get_device(handle), &config);
     if (result != LIBUSB_SUCCESS) {
         result = libusb_get_config_descriptor(libusb_get_device(handle), 0, &config);
@@ -779,16 +772,21 @@ std::string runProbe(int fd, int selectedMode, int durationMs) {
     }
 
 cleanup:
-    close(ownedFd);
     if (config != nullptr) {
         libusb_free_config_descriptor(config);
     }
+
+    // Release the claimed interface while both the libusb handle and the
+    // system FD wrapped by libusb_wrap_sys_device() are still valid.
     if (interfaceClaimed) {
         const int releaseResult = libusb_release_interface(handle, format.interfaceNumber);
         if (releaseResult != LIBUSB_SUCCESS) {
             report << describeError("libusb_release_interface", releaseResult) << "\n";
         }
     }
+
+    // Automatic detach is restored by libusb_release_interface(). A manually
+    // detached driver needs an explicit re-attach after the interface release.
     if (manuallyDetachedKernelDriver) {
         const int attachResult = libusb_attach_kernel_driver(handle, format.interfaceNumber);
         if (attachResult != LIBUSB_SUCCESS && attachResult != LIBUSB_ERROR_NOT_FOUND) {
@@ -797,7 +795,10 @@ cleanup:
             report << "Pilote noyau vidéo restauré après le test.\n";
         }
     }
+
+    // libusb_close() must run before closing the FD passed to wrap_sys_device().
     libusb_close(handle);
+    close(ownedFd);
     libusb_exit(ctx);
     return report.str();
 }
