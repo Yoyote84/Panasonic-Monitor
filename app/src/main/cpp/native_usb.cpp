@@ -473,7 +473,9 @@ bool runIsoSample(libusb_context* ctx,
     for (libusb_transfer* transfer : transfers) {
         libusb_free_transfer(transfer);
     }
-    return stats.packetsWithData > 0;
+    // A completed non-empty ISO packet is not enough: require bytes beyond
+    // a structurally valid UVC payload header before declaring transport success.
+    return stats.payloadBytes > 0;
 }
 
 std::string runProbe(int fd, int selectedMode, int durationMs) {
