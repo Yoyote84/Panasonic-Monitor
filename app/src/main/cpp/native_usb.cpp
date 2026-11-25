@@ -768,18 +768,18 @@ std::string runProbe(int fd, int selectedMode, int durationMs,
             std::string decoderError;
             if (!preview->start(decoderError)) {
                 report << "Démarrage du décodeur / aperçu impossible : "
-                       << decoderError << "\\n";
+                       << decoderError << "\n";
                 goto cleanup;
             }
-            report << "Aperçu vidéo en direct : décodage FFmpeg actif.\\n";
+            report << "Aperçu vidéo en direct : décodage FFmpeg actif.\n";
         }
 
         if (durationMs < 0) {
             report << "Flux isochrone continu : arrêt manuel depuis Android"
-                   << " · " << kTransferCount << " transferts\\n";
+                   << " · " << kTransferCount << " transferts\n";
         } else {
             report << "Échantillonnage isochrone : " << durationMs << " ms"
-                   << " · " << kTransferCount << " transferts\\n";
+                   << " · " << kTransferCount << " transferts\n";
         }
 
         IsoStats stats;
@@ -791,28 +791,28 @@ std::string runProbe(int fd, int selectedMode, int durationMs,
             report << preview->summary();
             preview.reset();
         }
-        report << "Paquets complétés : " << stats.completedPackets << "\\n";
-        report << "Paquets avec données : " << stats.packetsWithData << "\\n";
-        report << "Octets USB reçus : " << stats.rawBytes << "\\n";
-        report << "Octets de payload UVC : " << stats.payloadBytes << "\\n";
-        report << "Flags d'erreur UVC : " << stats.uvcErrorFlags << "\\n";
+        report << "Paquets complétés : " << stats.completedPackets << "\n";
+        report << "Paquets avec données : " << stats.packetsWithData << "\n";
+        report << "Octets USB reçus : " << stats.rawBytes << "\n";
+        report << "Octets de payload UVC : " << stats.payloadBytes << "\n";
+        report << "Flags d'erreur UVC : " << stats.uvcErrorFlags << "\n";
         report << "Erreurs de paquets / soumission : "
-               << stats.packetErrors << " / " << stats.submitErrors << "\\n";
+               << stats.packetErrors << " / " << stats.submitErrors << "\n";
 
         if (received) {
-            report << "RÉSULTAT : le transport isochrone a livré des données au téléphone.\\n";
+            report << "RÉSULTAT : le transport isochrone a livré des données au téléphone.\n";
             if (previewWindow != nullptr) {
-                report << "Le flux a été confié au décodeur ; vérifie le compteur d'images affichées.\\n";
-                report << "La synchronisation audio/vidéo reste à valider.\\n";
+                report << "Le flux a été confié au décodeur ; vérifie le compteur d'images affichées.\n";
+                report << "La synchronisation audio/vidéo reste à valider.\n";
             } else {
-                report << "Cela valide le transport, pas encore le décodage ou la synchronisation A/V.\\n";
+                report << "Cela valide le transport, pas encore le décodage ou la synchronisation A/V.\n";
             }
         } else {
-            report << "RÉSULTAT : aucun payload vidéo reçu pendant l'échantillonnage.\\n";
+            report << "RÉSULTAT : aucun payload vidéo reçu pendant l'échantillonnage.\n";
             if (wantDv) {
-                report << "Vérifie le mode Motion DV, le mode VCR/lecture et la lecture effective d'une cassette.\\n";
+                report << "Vérifie le mode Motion DV, le mode VCR/lecture et la lecture effective d'une cassette.\n";
             } else {
-                report << "Vérifie le mode Webcam et refais un test après reconnexion USB.\\n";
+                report << "Vérifie le mode Webcam et refais un test après reconnexion USB.\n";
             }
         }
     }
@@ -885,11 +885,11 @@ Java_fr_panasonic_monitor_MainActivity_nativeStartPreview(
         JNIEnv* env, jobject /* thiz */, jint usbFileDescriptor,
         jint mode, jobject surface) {
     if (surface == nullptr) {
-        return env->NewStringUTF("Surface Android manquante.\\n");
+        return env->NewStringUTF("Surface Android manquante.\n");
     }
     ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
     if (window == nullptr) {
-        return env->NewStringUTF("Impossible d'ouvrir la Surface Android.\\n");
+        return env->NewStringUTF("Impossible d'ouvrir la Surface Android.\n");
     }
     const std::string result = runProbe(
             static_cast<int>(usbFileDescriptor),
